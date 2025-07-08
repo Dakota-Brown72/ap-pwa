@@ -1,0 +1,32 @@
+node_modules/
+dist/
+*.log
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+pip-selfcheck.json
+*.egg-info/
+build/
+dist/
+.env
+*.local
+*.log
+*.pid
+
+# Node.js
+node_modules/
+dist/
+build/
+npm-debug.log
+yarn-error.log
+
+# IDEs
+.vscode/
+.idea/
+
+# OS-specific
+.DS_Store
+Thumbs.db

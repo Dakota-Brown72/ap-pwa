@@ -1,0 +1,193 @@
+mqtt:
+  host: mosquitto
+  port: 1883
+  topic_prefix: frigate
+  user: frigate
+  password: '#Frigate7214'
+
+# go2rtc configuration for live streaming
+go2rtc:
+  streams:
+    Frontyard_main:
+      - rtsp://Dakota:%23Dakman7214@192.168.1.112:554/h265Preview_01_main
+    Frontyard_sub:
+      - rtsp://Dakota:%23Dakman7214@192.168.1.112:554/h264Preview_01_sub
+    Backyard_main:
+      - rtsp://Dakota:%23Dakman7214@192.168.1.113:554/h265Preview_01_main
+    Backyard_sub:
+      - rtsp://Dakota:%23Dakman7214@192.168.1.113:554/h264Preview_01_sub
+    Living_Room:
+      - rtsp://Dakota:%23Dakman7214@192.168.1.114:554/h265Preview_01_main
+    Nursery:
+      - rtsp://Dakota:%23Dakman7214@192.168.1.115:554/h265Preview_01_main
+
+  # HLS configuration
+  hls:
+    enabled: true
+    segment_duration: 4
+    segment_count: 6
+    segment_maxsize: 50MB
+
+# Detector configuration - TensorRT
+detectors:
+  tensorrt:
+    type: tensorrt
+    device: 0
+
+# Model configuration - TensorRT
+model:
+  path: /config/model_cache/tensorrt/yolov7-320.trt
+  labelmap_path: /labelmap/coco-80.txt
+  input_tensor: nhwc
+  input_pixel_format: rgb
+  width: 320
+  height: 320
+
+# Recording configuration
+record:
+  enabled: true
+  retain:
+    days: 7
+    mode: motion
+
+# Snapshots configuration
+snapshots:
+  enabled: true
+  timestamp: true
+  bounding_box: true
+  retain:
+    default: 14
+
+# FFmpeg configuration - CPU decoding (temporary fix for CUDA issues)
+ffmpeg:
+  input_args:
+    - -avoid_negative_ts
+    - make_zero
+    - -fflags
+    - +genpts+discardcorrupt
+    - -rtsp_transport
+    - tcp
+
+# Camera configurations - Using go2rtc proxy for better performance
+cameras:
+  Frontyard:
+    ffmpeg:
+      inputs:
+        - path: rtsp://localhost:8554/Frontyard_sub
+          roles: [detect]
+        - path: rtsp://localhost:8554/Frontyard_main
+          roles: [record]
+    live:
+      stream_name: Frontyard_main
+    detect:
+      enabled: true
+    motion:
+      threshold: 15          # Even more sensitive for outdoor
+      contour_area: 80       # Detect smaller objects
+      delta_alpha: 0.3       # More responsive
+      frame_alpha: 0.3       # More responsive
+    record:
+      enabled: true          # Enable continuous recording for outdoor
+      retain:
+        days: 7
+        mode: all            # Continuous recording for outdoor cameras
+    snapshots:
+      enabled: true
+
+    objects:
+      filters:
+        car:
+          mask: 
+            0.426,0.376,0.485,0.353,0.535,0.309,0.598,0.299,0.649,0.309,0.695,0.327,0.724,0.383,0.735,0.429,0.724,0.509,0.692,0.55,0.669,0.55,0.63,0.524,0.537,0.535,0.521,0.563,0.476,0.572,0.444,0.55,0.402,0.501,0.389,0.451,0.401,0.398
+  Backyard:
+    ffmpeg:
+      inputs:
+        - path: rtsp://localhost:8554/Backyard_sub
+          roles: [detect]
+        - path: rtsp://localhost:8554/Backyard_main
+          roles: [record]
+    live:
+      stream_name: Backyard_main
+    detect:
+      enabled: true
+    motion:
+      threshold: 15          # Even more sensitive for outdoor
+      contour_area: 80       # Detect smaller objects
+      delta_alpha: 0.3       # More responsive
+      frame_alpha: 0.3       # More responsive
+    record:
+      enabled: true          # Enable continuous recording for outdoor
+      retain:
+        days: 7
+        mode: all            # Continuous recording for outdoor cameras
+    snapshots:
+      enabled: true
+
+    objects:
+      filters:
+        car:
+          mask: 
+            0.443,0.45,0.463,0.412,0.495,0.403,0.493,0.329,0.557,0.309,0.608,0.302,0.615,0.374,0.599,0.412,0.583,0.461,0.58,0.5,0.542,0.496,0.485,0.503,0.451,0.491
+  Living_Room:
+    ffmpeg:
+      inputs:
+        - path: rtsp://localhost:8554/Living_Room
+          roles:
+            - record
+    live:
+      stream_name: Living_Room
+    detect:
+      enabled: false         # No detection for inside cameras
+    record:
+      enabled: true
+      retain:
+        days: 7
+        mode: all            # Continuous recording for inside
+    snapshots:
+      enabled: true
+
+  Nursery:
+    ffmpeg:
+      inputs:
+        - path: rtsp://localhost:8554/Nursery
+          roles:
+            - record
+    live:
+      stream_name: Nursery
+    detect:
+      enabled: false         # No detection for inside cameras
+    record:
+      enabled: true
+      retain:
+        days: 7
+        mode: all            # Continuous recording for inside
+    snapshots:
+      enabled: true
+
+# Global configuration
+objects:
+  track:
+    - person
+    - car
+    - truck
+    - motorcycle
+    - bicycle
+    - bus
+
+# Motion detection - More sensitive for better detection
+motion:
+  threshold: 20          # Lowered from 35 to 20 (more sensitive)
+  contour_area: 100      # Lowered from 200 to 100 (smaller objects)
+  delta_alpha: 0.2       # Increased from 0.1 to 0.2 (more responsive)
+  frame_alpha: 0.2       # Increased from 0.1 to 0.2 (more responsive)
+
+# Logging configuration
+logger:
+  default: info
+  logs:
+    frigate.mqtt: error
+    frigate.app: info
+    frigate.detectors: info
+
+# Version
+version: 0.15-1

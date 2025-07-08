@@ -1,0 +1,147 @@
+version: "3.9"
+
+services:
+  # Frigate NVR
+  frigate:
+    container_name: frigate
+    image: ghcr.io/blakeblackshear/frigate:stable-tensorrt
+    privileged: true
+    restart: unless-stopped
+    shm_size: "1g"
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      - ./frigate/config:/config
+      - ./frigate/media:/media/frigate
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "5000:5000"   # Frigate web UI
+      - "1935:1935"   # RTMP
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility,graphics
+      - YOLO_MODELS=yolov7-320
+      - USE_FP16=false
+      - TRT_MODEL_PREP_DEVICE=0
+      - CUDA_VISIBLE_DEVICES=0
+      - CUDA_LAUNCH_BLOCKING=1
+    depends_on:
+      - mosquitto
+    networks:
+      - anchorpoint-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # MQTT Broker
+  mosquitto:
+    container_name: mosquitto
+    image: eclipse-mosquitto:2.0
+    restart: unless-stopped
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    networks:
+      - anchorpoint-network
+
+  # PWA Backend (Flask)
+  pwa-backend:
+    container_name: pwa-backend
+    build:
+      context: ./pwa/backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+      - ./pwa/backend:/app
+      - ./frigate/media:/media/frigate
+    ports:
+      - "5003:5003"   # Backend API
+    environment:
+      - FLASK_ENV=development
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - DATABASE_PATH=/data/anchorpoint.db
+      - FRIGATE_HOST=http://frigate:5000
+      - GO2RTC_HOST=http://frigate:1984
+    depends_on:
+      - frigate
+    networks:
+      - anchorpoint-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:5003/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # PWA Frontend (Vue.js)
+  pwa-frontend:
+    container_name: pwa-frontend
+    image: node:20
+    working_dir: /app
+    volumes:
+      - ./pwa:/app
+    ports:
+      - "5173:5173"
+    command: sh -c "npm install && npm run dev -- --host=0.0.0.0"
+    depends_on:
+      - pwa-backend
+    networks:
+      - anchorpoint-network
+
+  # Caddy Reverse Proxy (for production)
+  caddy:
+    container_name: caddy
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile
+      - ./caddy/data:/data
+      - ./caddy/config:/config
+    depends_on:
+      - pwa-backend
+      - pwa-frontend
+    networks:
+      - anchorpoint-network
+
+  # Netdata for system monitoring
+  netdata:
+    container_name: netdata
+    image: netdata/netdata:latest
+    restart: unless-stopped
+    ports:
+      - "19999:19999"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./netdata/config:/etc/netdata
+      - ./netdata/data:/var/lib/netdata
+    environment:
+      - NETDATA_HOSTNAME=anchorpoint-system
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - apparmor:unconfined
+    networks:
+      - anchorpoint-network
+
+networks:
+  anchorpoint-network:
+    driver: bridge 

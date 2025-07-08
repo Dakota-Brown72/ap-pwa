@@ -1,0 +1,77 @@
+@import 'tailwindcss';
+@plugin 'daisyui';
+
+
+@plugin "daisyui/theme" {
+  name: "anchorpoint";
+  default: false;
+  prefersdark: false;
+  color-scheme: "light";
+  --color-base-100: #ffffff;
+  --color-base-200: oklch(98% 0 0);
+  --color-base-300: oklch(95% 0 0);
+  --color-base-content: oklch(21% 0.006 285.885);
+  --color-primary: #E8E4DD;
+  --color-primary-content: #577180;
+  --color-secondary: #959899;
+  --color-secondary-content: oklch(97% 0.001 106.424);
+  --color-accent: #577180;
+  --color-accent-content: oklch(96% 0.003 264.542);
+  --color-neutral: #595D5F;
+  --color-neutral-content: oklch(92% 0.004 286.32);
+  --color-info: #577180;
+  --color-info-content: oklch(29% 0.066 243.157);
+  --color-success: #959899;
+  --color-success-content: oklch(37% 0.077 168.94);
+  --color-warning: #FBBD23;
+  --color-warning-content: oklch(41% 0.112 45.904);
+  --color-error: #F87272;
+  --color-error-content: oklch(27% 0.105 12.094);
+  --radius-selector: 2rem;
+  --radius-field: 2rem;
+  --radius-box: 1rem;
+  --size-selector: 0.3125rem;
+  --size-field: 0.25rem;
+  --border: 2px;
+  --depth: 1;
+  --noise: 0;
+}
+
+
+
+@plugin "daisyui/theme" {
+  name: "anchorpointdark";
+  default: false;
+  prefersdark: false;
+  color-scheme: "dark";
+  --color-base-100: #0f1419;
+  --color-base-200: #1a1f2e;
+  --color-base-300: #2a3142;
+  --color-base-content: #e2e8f0;
+  --color-primary: #577180;
+  --color-primary-content: #ffffff;
+  --color-secondary: #334155;
+  --color-secondary-content: #f1f5f9;
+  --color-accent: #3b82f6;
+  --color-accent-content: #ffffff;
+  --color-neutral: #475569;
+  --color-neutral-content: #f8fafc;
+  --color-info: #0ea5e9;
+  --color-info-content: #ffffff;
+  --color-success: #10b981;
+  --color-success-content: #ffffff;
+  --color-warning: #f59e0b;
+  --color-warning-content: #ffffff;
+  --color-error: #ef4444;
+  --color-error-content: #ffffff;
+  --radius-selector: 2rem;
+  --radius-field: 2rem;
+  --radius-box: 1rem;
+  --size-selector: 0.3125rem;
+  --size-field: 0.25rem;
+  --border: 2px;
+  --depth: 1;
+  --noise: 0;
+}
+
+

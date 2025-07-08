@@ -1,0 +1,78 @@
+# AnchorPoint Systems - Git Ignore File
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+data/anchorpoint.db
+pwa/data/anchorpoint.db
+
+# Media files (large video/recording files)
+frigate/media/
+frigate/media/clips/
+frigate/media/recordings/
+frigate/media/exports/
+frigate/media/lost+found/
+
+# Model cache files (large TensorRT models)
+frigate/config/model_cache/
+frigate/config/backup.db
+frigate/config/backup_config.yaml
+
+# Log files
+*.log
+mosquitto/log/
+netdata/data/
+
+# Environment files with secrets
+.env
+env.example
+
+# Docker volumes and data
+caddy/data/
+mosquitto/data/
+netdata/data/
+
+# Node modules and build artifacts
+pwa/node_modules/
+pwa/dist/
+pwa/build/
+pwa/.vite/
+
+# Python virtual environments
+pwa/backend/venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# SSL certificates and keys
+*.pem
+*.key
+*.crt
+*.csr
+
+# Backup files
+*.backup
+backup_* 
