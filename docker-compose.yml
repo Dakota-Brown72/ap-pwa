@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   # Frigate NVR
   frigate:
@@ -7,23 +5,24 @@ services:
     image: ghcr.io/blakeblackshear/frigate:stable-tensorrt
     privileged: true
     restart: unless-stopped
-    shm_size: "1g"
+    shm_size: "2g"  # Increased for better streaming performance
+    # Use host networking for WebRTC connectivity
+    network_mode: "host"
     devices:
-      - /dev/dri:/dev/dri
+      - /dev/dri:/dev/dri  # Intel QSV hardware acceleration
     volumes:
       - ./frigate/config:/config
+      - ./frigate/config/go2rtc:/usr/local/go2rtc/bin/go2rtc:ro
       - ./frigate/media:/media/frigate
       - /etc/localtime:/etc/localtime:ro
-    ports:
-      - "5000:5000"   # Frigate web UI
-      - "1935:1935"   # RTMP
+    # No ports needed with host networking
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               device_ids: ['0']
-              capabilities: [gpu]
+              capabilities: [gpu, compute, video, graphics, utility]  # Full capabilities for NVENC/NVDEC
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility,graphics
@@ -32,10 +31,10 @@ services:
       - TRT_MODEL_PREP_DEVICE=0
       - CUDA_VISIBLE_DEVICES=0
       - CUDA_LAUNCH_BLOCKING=1
-    depends_on:
-      - mosquitto
-    networks:
-      - anchorpoint-network
+      # Hardware acceleration environment variables
+      - LIBVA_DRIVER_NAME=i965  # Intel QSV driver
+      - VAAPI_DEVICE=/dev/dri/renderD128  # Intel iGPU device
+    # Host networking - no depends_on or networks needed
     logging:
       driver: json-file
       options:
@@ -68,14 +67,19 @@ services:
       - ./data:/data
       - ./pwa/backend:/app
       - ./frigate/media:/media/frigate
+      - ./hls-segments:/segments
     ports:
       - "5003:5003"   # Backend API
+    env_file:
+      - ./pwa/backend/config.env
     environment:
       - FLASK_ENV=development
       - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
       - DATABASE_PATH=/data/anchorpoint.db
-      - FRIGATE_HOST=http://frigate:5000
-      - GO2RTC_HOST=http://frigate:1984
+      - FRIGATE_HOST=http://172.18.0.1:5000
+      - GO2RTC_HOST=http://172.18.0.1:1984
+      - HLS_SEGMENTS_PATH=/segments
+      - FFMPEG_SERVICE_HOST=http://172.18.0.1:8080
     depends_on:
       - frigate
     networks:
@@ -94,8 +98,7 @@ services:
     working_dir: /app
     volumes:
       - ./pwa:/app
-    ports:
-      - "5173:5173"
+    # No ports exposed to host; Caddy reverse proxy handles all external access
     command: sh -c "npm install && npm run dev -- --host=0.0.0.0"
     depends_on:
       - pwa-backend
@@ -120,27 +123,21 @@ services:
     networks:
       - anchorpoint-network
 
-  # Netdata for system monitoring
-  netdata:
-    container_name: netdata
-    image: netdata/netdata:latest
+
+
+  # FFmpeg container for RTSP to HLS conversion
+  ffmpeg-streamer:
+    container_name: ffmpeg-streamer
+    build:
+      context: ./ffmpeg
+      dockerfile: Dockerfile
     restart: unless-stopped
-    ports:
-      - "19999:19999"
+    network_mode: "host"  # Use host networking to access cameras
+    env_file:
+      - ./pwa/backend/config.env
     volumes:
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./netdata/config:/etc/netdata
-      - ./netdata/data:/var/lib/netdata
-    environment:
-      - NETDATA_HOSTNAME=anchorpoint-system
-    cap_add:
-      - SYS_PTRACE
-    security_opt:
-      - apparmor:unconfined
-    networks:
-      - anchorpoint-network
+      - ./hls-segments:/segments
+    # Custom Ubuntu image with FFmpeg and our streaming script
 
 networks:
   anchorpoint-network:

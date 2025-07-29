@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HLS Stream Test</title>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #1a1a1a;
+            color: white;
+        }
+        video {
+            width: 100%;
+            max-width: 800px;
+            height: auto;
+            background-color: #000;
+        }
+        .info {
+            margin: 10px 0;
+            padding: 10px;
+            background-color: #333;
+            border-radius: 5px;
+        }
+        button {
+            margin: 5px;
+            padding: 10px 20px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+    </style>
+</head>
+<body>
+    <h1>FFmpeg HLS Stream Test</h1>
+    <div class="info">
+        <p><strong>Token:</strong> <span id="token">Not set</span></p>
+        <p><strong>HLS Support:</strong> <span id="hlsSupport"></span></p>
+        <p><strong>Native HLS:</strong> <span id="nativeHls"></span></p>
+        <p><strong>Status:</strong> <span id="status">Ready</span></p>
+    </div>
+    
+    <video id="video" controls muted playsinline></video>
+    
+    <div style="margin: 20px 0;">
+        <button onclick="testNursery()">Test Nursery Camera</button>
+        <button onclick="testFrontyard()">Test Frontyard Camera</button>
+        <button onclick="testBackyard()">Test Backyard Camera</button>
+        <button onclick="testLivingRoom()">Test Living Room Camera</button>
+        <button onclick="getToken()">Get Auth Token</button>
+    </div>
+    
+    <div id="logs" class="info" style="height: 200px; overflow-y: auto; font-family: monospace; font-size: 12px;"></div>
+
+    <script>
+        let hls = null;
+        let authToken = null;
+        
+        function log(message) {
+            const logs = document.getElementById('logs');
+            const timestamp = new Date().toLocaleTimeString();
+            logs.innerHTML += `[${timestamp}] ${message}<br>`;
+            logs.scrollTop = logs.scrollHeight;
+            console.log(message);
+        }
+        
+        function updateStatus(status) {
+            document.getElementById('status').textContent = status;
+            log(`Status: ${status}`);
+        }
+        
+        // Check HLS support
+        document.getElementById('hlsSupport').textContent = Hls.isSupported() ? 'Yes (HLS.js)' : 'No';
+        
+        // Check native HLS support
+        const video = document.getElementById('video');
+        const nativeSupport = video.canPlayType('application/vnd.apple.mpegurl') !== '';
+        document.getElementById('nativeHls').textContent = nativeSupport ? 'Yes' : 'No';
+        
+        log(`HLS.js supported: ${Hls.isSupported()}`);
+        log(`Native HLS supported: ${nativeSupport}`);
+        
+        async function getToken() {
+            try {
+                updateStatus('Getting auth token...');
+                const response = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        username: 'DJBrown96',
+                        password: '#Dakman7214219!'
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`Login failed: ${response.status}`);
+                }
+                
+                const data = await response.json();
+                authToken = data.token;
+                document.getElementById('token').textContent = authToken.substring(0, 50) + '...';
+                updateStatus('Token obtained successfully');
+                log(`Token: ${authToken.substring(0, 50)}...`);
+                
+            } catch (error) {
+                log(`Token error: ${error.message}`);
+                updateStatus('Token failed');
+            }
+        }
+        
+        function destroyHls() {
+            if (hls) {
+                log('Destroying existing HLS instance');
+                hls.destroy();
+                hls = null;
+            }
+        }
+        
+        function loadHlsStream(url) {
+            if (!authToken) {
+                alert('Please get auth token first');
+                return;
+            }
+            
+            const streamUrl = `${url}?token=${encodeURIComponent(authToken)}&t=${Date.now()}`;
+            log(`Loading HLS stream: ${url}`);
+            
+            destroyHls();
+            updateStatus('Loading stream...');
+            
+            if (nativeSupport) {
+                log('Using native HLS support');
+                video.src = streamUrl;
+                video.load();
+            } else if (Hls.isSupported()) {
+                log('Using HLS.js');
+                hls = new Hls({
+                    debug: false,
+                    enableWorker: true,
+                    lowLatencyMode: false
+                });
+                
+                hls.loadSource(streamUrl);
+                hls.attachMedia(video);
+                
+                hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                    log('HLS manifest parsed successfully');
+                    updateStatus('Manifest loaded - ready to play');
+                });
+                
+                hls.on(Hls.Events.FRAG_LOADED, (event, data) => {
+                    log(`Fragment loaded: ${data.frag.sn}`);
+                });
+                
+                hls.on(Hls.Events.ERROR, (event, data) => {
+                    log(`HLS Error: ${data.type} - ${data.details}`);
+                    if (data.fatal) {
+                        updateStatus(`Fatal HLS error: ${data.details}`);
+                    }
+                });
+            } else {
+                log('HLS not supported');
+                updateStatus('HLS not supported');
+            }
+        }
+        
+        function testNursery() {
+            loadHlsStream('/api/camera/Nursery/stream.m3u8');
+        }
+        
+        function testFrontyard() {
+            loadHlsStream('/api/camera/Frontyard/stream.m3u8');
+        }
+        
+        function testBackyard() {
+            loadHlsStream('/api/camera/Backyard/stream.m3u8');
+        }
+        
+        function testLivingRoom() {
+            loadHlsStream('/api/camera/Living_Room/stream.m3u8');
+        }
+        
+        // Video event handlers
+        video.addEventListener('loadstart', () => {
+            log('Video loadstart');
+            updateStatus('Video loading...');
+        });
+        
+        video.addEventListener('loadedmetadata', () => {
+            log('Video metadata loaded');
+            updateStatus('Metadata loaded');
+        });
+        
+        video.addEventListener('canplay', () => {
+            log('Video can play');
+            updateStatus('Ready to play');
+        });
+        
+        video.addEventListener('playing', () => {
+            log('Video playing');
+            updateStatus('Playing');
+        });
+        
+        video.addEventListener('error', (e) => {
+            const error = video.error;
+            let errorMsg = 'Unknown error';
+            if (error) {
+                switch(error.code) {
+                    case error.MEDIA_ERR_ABORTED:
+                        errorMsg = 'Aborted';
+                        break;
+                    case error.MEDIA_ERR_NETWORK:
+                        errorMsg = 'Network error';
+                        break;
+                    case error.MEDIA_ERR_DECODE:
+                        errorMsg = 'Decode error';
+                        break;
+                    case error.MEDIA_ERR_SRC_NOT_SUPPORTED:
+                        errorMsg = 'Source not supported';
+                        break;
+                }
+            }
+            log(`Video error: ${errorMsg}`);
+            updateStatus(`Video error: ${errorMsg}`);
+        });
+        
+        // Auto-get token on load
+        log('Page loaded - ready for testing');
+        getToken();
+    </script>
+</body>
+</html> 

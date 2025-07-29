@@ -1,0 +1,101 @@
+{
+  "id": "/anchorpoint/",
+  "name": "AnchorPoint Security System",
+  "short_name": "AnchorPoint",
+  "description": "Professional surveillance and security system for home and business monitoring",
+  "start_url": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#1a1a1a",
+  "theme_color": "#E8E4DD",
+  "lang": "en-US",
+  "scope": "/",
+  "categories": ["security", "utilities", "monitoring"],
+  "iarc_rating_id": "e84b072d-71b3-4d3e-86ae-31a8ce4e53b7",
+  "prefer_related_applications": false,
+  "icons": [
+    {
+      "src": "/icons/icon-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-512x512-maskable.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icons/ico-48x48.ico",
+      "sizes": "48x48",
+      "type": "image/x-icon"
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "/screenshots/desktop-home.png",
+      "sizes": "1280x720",
+      "type": "image/png",
+      "form_factor": "wide",
+      "label": "Camera monitoring dashboard"
+    },
+    {
+      "src": "/screenshots/mobile-cameras.png", 
+      "sizes": "390x844",
+      "type": "image/png",
+      "form_factor": "narrow",
+      "label": "Mobile camera view"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Live Cameras",
+      "short_name": "Cameras",
+      "description": "View live camera feeds",
+      "url": "/cameras",
+      "icons": [
+        {
+          "src": "/icons/camera-shortcut.png",
+          "sizes": "96x96",
+          "type": "image/png"
+        }
+      ]
+    },
+    {
+      "name": "Settings",
+      "short_name": "Settings",
+      "description": "System configuration",
+      "url": "/settings",
+      "icons": [
+        {
+          "src": "/icons/settings-shortcut.png",
+          "sizes": "96x96", 
+          "type": "image/png"
+        }
+      ]
+    }
+  ],
+  "file_handlers": [
+    {
+      "action": "/video-import",
+      "accept": {
+        "video/mp4": [".mp4"],
+        "video/quicktime": [".mov"]
+      }
+    }
+  ],
+  "protocol_handlers": [
+    {
+      "protocol": "rtsp",
+      "url": "/stream?url=%s"
+    }
+  ]
+} 

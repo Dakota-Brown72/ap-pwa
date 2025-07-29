@@ -9,17 +9,53 @@ import Settings from '@/views/Settings.vue'
 import Login from '@/views/Login.vue'
 
 const routes = [
+  // Login route outside of layout (no navigation)
+  {
+    path: '/login',
+    name: 'Login',
+    component: Login,
+    meta: { requiresAuth: false }
+  },
+  // Protected routes with layout
   {
     path: '/',
     component: Layout,
+    meta: { requiresAuth: true },
     children: [
-      { path: '/', redirect: '/dashboard' },
-      { path: '/login', component: Login },
-      { path: '/dashboard', component: Home },
-      { path: '/multiview', component: CameraMultiview },
-      { path: '/camera/:id', component: CameraView },
-      { path: '/review', component: CameraReview },
-      { path: '/settings', component: Settings },
+      { 
+        path: '', 
+        redirect: '/dashboard' 
+      },
+      { 
+        path: '/dashboard', 
+        name: 'Dashboard',
+        component: Home,
+        meta: { requiresAuth: true }
+      },
+      { 
+        path: '/multiview', 
+        name: 'Multiview',
+        component: CameraMultiview,
+        meta: { requiresAuth: true }
+      },
+      { 
+        path: '/camera/:id', 
+        name: 'Camera',
+        component: CameraView,
+        meta: { requiresAuth: true }
+      },
+      { 
+        path: '/review', 
+        name: 'Review',
+        component: CameraReview,
+        meta: { requiresAuth: true }
+      },
+      { 
+        path: '/settings', 
+        name: 'Settings',
+        component: Settings,
+        meta: { requiresAuth: true }
+      },
     ]
   }
 ]
@@ -27,6 +63,23 @@ const routes = [
 const router = createRouter({
   history: createWebHistory(),
   routes,
+})
+
+// Authentication guard
+router.beforeEach((to, from, next) => {
+  const token = localStorage.getItem('auth_token')
+  const requiresAuth = to.matched.some(record => record.meta.requiresAuth !== false)
+  
+  if (requiresAuth && !token) {
+    // Redirect to login if authentication is required but no token exists
+    next('/login')
+  } else if (to.path === '/login' && token) {
+    // Redirect to dashboard if already authenticated and trying to access login
+    next('/dashboard')
+  } else {
+    // Proceed normally
+    next()
+  }
 })
 
 export default router

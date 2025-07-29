@@ -15,12 +15,12 @@ STREAM_TIMEOUT = 120
 PID_DIR = "/tmp/ffmpeg"
 SEGMENT_DIR = "/segments"
 
-# Camera URLs
+# Camera URLs - loaded from environment variables
 CAMERA_URLS = {
-    "frontyard": "rtsp://Dakota:%23Dakman7214@192.168.1.112:554/h264Preview_01_sub",
-    "backyard": "rtsp://Dakota:%23Dakman7214@192.168.1.113:554/h264Preview_01_sub", 
-    "living_room": "rtsp://Dakota:%23Dakman7214@192.168.1.114:554/h264Preview_01_main",
-    "nursery": "rtsp://Dakota:%23Dakman7214@192.168.1.115:554/h264Preview_01_main"
+    "frontyard": os.getenv("CAMERA_FRONTYARD_URL", "rtsp://username:password@192.168.1.xxx:554/h264Preview_01_sub"),
+    "backyard": os.getenv("CAMERA_BACKYARD_URL", "rtsp://username:password@192.168.1.xxx:554/h264Preview_01_sub"), 
+    "living_room": os.getenv("CAMERA_LIVING_ROOM_URL", "rtsp://username:password@192.168.1.xxx:554/h264Preview_01_main"),
+    "nursery": os.getenv("CAMERA_NURSERY_URL", "rtsp://username:password@192.168.1.xxx:554/h264Preview_01_main")
 }
 
 class StreamManager:

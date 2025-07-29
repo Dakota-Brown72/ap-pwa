@@ -1,62 +1,50 @@
 # AnchorPoint Surveillance System - Caddy Configuration
+# Disable automatic HTTPS for Cloudflare tunnel setup
 
-# Development configuration for local testing
+{
+    auto_https off
+}
+
+# Serve HTTP directly (Cloudflare handles TLS termination)
 :80 {
-    # Internal network access (no authentication required)
-    @internal_network {
-        remote_ip 127.0.0.1 ::1 192.168.1.0/24
+    # All streaming endpoints now go through Flask backend for authentication
+    # This prevents unauthorized access to camera streams
+    
+    handle /api/frigate/* {
+        uri strip_prefix /api/frigate
+        reverse_proxy 172.18.0.1:5000
     }
     
-    # Handle internal network requests
-    handle @internal_network {
-        
-        # Proxy PWA backend API
-        handle /api/* {
-            reverse_proxy pwa-backend:5003
-        }
-        
-        # Proxy PWA frontend
-        handle /* {
-            reverse_proxy pwa-frontend:5173
-        }
-    }
+    # WebRTC is now disabled - HLS provides better tunnel compatibility
+    # reverse_proxy /api/webrtc frigate:8555
     
-    # External access (with authentication if needed)
-    handle {
-        # For now, allow all access - add authentication later if needed
-        # authorize with admin_policy
-        
-        # Proxy PWA backend API
-        handle /api/* {
-            reverse_proxy pwa-backend:5003
-        }
-        
-        # Proxy PWA frontend
-        handle /* {
-            reverse_proxy pwa-frontend:5173
-        }
-    }
+    # Flask backend API (catch-all for remaining /api/* routes)
+    reverse_proxy /api/* pwa-backend:5003
     
-    # Security headers
+    # PWA frontend (catch-all)
+    reverse_proxy pwa-frontend:5173
+
     header {
+        X-Forwarded-Proto https
         X-Content-Type-Options nosniff
         X-Frame-Options DENY
         X-XSS-Protection "1; mode=block"
         Referrer-Policy strict-origin-when-cross-origin
     }
-    
-    # Logging
+
+    # Cloudflare cache bypass for streaming endpoints
+    @streaming {
+        path *.m3u8 *.ts *.mp4
+    }
+    header @streaming {
+        Cache-Control "no-store, no-cache, must-revalidate, max-age=0"
+        Pragma "no-cache"
+        Expires "0"
+        CF-Cache-Status "BYPASS"
+    }
+
     log {
         output stdout
         format console
     }
 }
-
-# Development configuration (uncomment for local development)
-# :5173 {
-#     reverse_proxy pwa-frontend:5173
-# }
-# 
-# :5001 {
-#     reverse_proxy pwa-backend:5001
-# } 

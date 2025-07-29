@@ -1,1204 +1,1203 @@
 import os
+import logging
 import sqlite3
+import requests
 import jwt
 import bcrypt
-import requests
 from datetime import datetime, timedelta
 from functools import wraps
-from flask import Flask, jsonify, request, send_from_directory, Response, stream_with_context
+from flask import Flask, request, jsonify, Response, send_from_directory, send_file
 from flask_cors import CORS
-import logging
-from logging.handlers import RotatingFileHandler
+from stream_buffer import get_stream_buffer, shutdown_stream_buffer
 
-# Set up logging
-LOG_LEVEL = os.environ.get('LOG_LEVEL', 'DEBUG' if os.environ.get('FLASK_ENV') == 'development' else 'INFO')
-LOG_FORMAT = '[%(asctime)s] %(levelname)s in %(module)s: %(message)s'
-LOG_FILE = os.environ.get('BACKEND_LOG_FILE', '/tmp/anchorpoint-backend.log')
-
-handler = RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=2)
-handler.setFormatter(logging.Formatter(LOG_FORMAT))
-logging.basicConfig(level=LOG_LEVEL, handlers=[handler, logging.StreamHandler()])
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Memory management settings
-import gc
-import threading
-import time
-
-# Try to import psutil for memory monitoring (optional)
-try:
-    import psutil
-    PSUTIL_AVAILABLE = True
-except ImportError:
-    PSUTIL_AVAILABLE = False
-    logger.warning("psutil not available - memory monitoring disabled")
-
-# Global cache for API responses (with TTL)
-API_CACHE = {}
-CACHE_TTL = 30  # seconds
-CACHE_CLEANUP_INTERVAL = 60  # seconds
-
-def cleanup_cache():
-    """Periodically clean up expired cache entries"""
-    while True:
-        try:
-            current_time = time.time()
-            expired_keys = []
-            
-            for key, (data, timestamp) in API_CACHE.items():
-                if current_time - timestamp > CACHE_TTL:
-                    expired_keys.append(key)
-            
-            for key in expired_keys:
-                del API_CACHE[key]
-                
-            if expired_keys:
-                logger.debug(f"Cleaned up {len(expired_keys)} expired cache entries")
-                
-            # Force garbage collection periodically
-            gc.collect()
-            
-        except Exception as e:
-            logger.error(f"Cache cleanup error: {e}")
-        
-        time.sleep(CACHE_CLEANUP_INTERVAL)
-
-# Start cache cleanup thread
-cache_cleanup_thread = threading.Thread(target=cleanup_cache, daemon=True)
-cache_cleanup_thread.start()
-
-# Import frame capture service
-try:
-    from frame_capture import frame_capture
-    FRAME_CAPTURE_AVAILABLE = True
-except ImportError:
-    logger.warning("Warning: Frame capture not available (OpenCV not installed)")
-    FRAME_CAPTURE_AVAILABLE = False
-
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-change-in-production')
-app.config['DATABASE'] = os.environ.get('DATABASE_PATH', '../data/anchorpoint.db')
 
-# Enable CORS
-CORS(app, resources={r"/api/*": {"origins": ["http://localhost:3000", "http://localhost:5173"]}})
+# CORS configuration - domains from environment variable
+cors_origins = os.getenv('CORS_ORIGINS', 'http://localhost:5173,http://localhost:3000').split(',')
+CORS(app, origins=cors_origins, supports_credentials=True)
 
-# Frigate API configuration
-FRIGATE_HOST = os.environ.get('FRIGATE_HOST', 'http://frigate:5000')
+# Configuration
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'your-secret-key-change-in-production')
+DATABASE_PATH = os.getenv('DATABASE_PATH', '/data/anchorpoint.db')
+FRIGATE_HOST = os.getenv('FRIGATE_HOST', 'http://frigate:5000')
+GO2RTC_HOST = os.getenv('GO2RTC_HOST', 'http://frigate:1984')
+HLS_SEGMENTS_PATH = os.getenv('HLS_SEGMENTS_PATH', '/segments')
+FFMPEG_SERVICE_HOST = os.getenv('FFMPEG_SERVICE_HOST', 'http://ffmpeg-streamer:8080')  # On-demand FFmpeg service
 
-# go2rtc API configuration
-GO2RTC_HOST = os.environ.get('GO2RTC_HOST', 'http://go2rtc:1984')
-GO2RTC_USERNAME = os.environ.get('GO2RTC_USERNAME', 'Dakota')
-GO2RTC_PASSWORD = os.environ.get('GO2RTC_PASSWORD', '#Dakman7214')
+# Database helper functions
+def get_db_connection():
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-@app.route('/api/go2rtc/streams', methods=['GET'])
-def get_go2rtc_streams():
-    """Proxy go2rtc streams API"""
+def verify_password(plain_password, hashed_password):
+    """Verify a password against its hash"""
+    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+
+def create_token(user_id):
+    """Create JWT token"""
+    payload = {
+        'user_id': user_id,
+        'exp': datetime.utcnow() + timedelta(hours=24),
+        'iat': datetime.utcnow()
+    }
+    return jwt.encode(payload, app.config['SECRET_KEY'], algorithm='HS256')
+
+# On-demand FFmpeg streaming functions
+def start_ffmpeg_stream(camera_id):
+    """Start FFmpeg stream for a camera via the on-demand service"""
     try:
-        url = f"{GO2RTC_HOST}/api/streams"
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        
-        return jsonify(response.json())
-    except requests.RequestException as e:
-        logger.error(f"go2rtc streams API error: {e}")
-        return jsonify({'error': 'Failed to fetch go2rtc streams'}), 500
+        response = requests.post(f"{FFMPEG_SERVICE_HOST}/api/stream/{camera_id}/start", timeout=10)
+        logger.info(f"Started FFmpeg stream for {camera_id} - Response: {response.status_code}")
+        return True  # Consider success if we get any response
+    except Exception as e:
+        logger.error(f"Error starting FFmpeg stream for {camera_id}: {e}")
+        return False
 
-@app.route('/api/go2rtc/stream/<stream_name>/hls/<path:subpath>', methods=['GET'])
-def proxy_go2rtc_hls(stream_name, subpath):
-    """Proxy go2rtc HLS streams"""
+def stop_ffmpeg_stream(camera_id):
+    """Stop FFmpeg stream for a camera via the on-demand service"""
     try:
-        # Build the go2rtc HLS URL - use the correct format
-        url = f"{GO2RTC_HOST}/api/stream.m3u8?src={stream_name}"
-        
-        # Stream the response from go2rtc
-        response = requests.get(url, stream=True, timeout=30)
-        response.raise_for_status()
-        
-        # Return the file with proper headers
-        headers = {
-            'Content-Type': response.headers.get('Content-Type', 'application/vnd.apple.mpegurl'),
-            'Content-Length': response.headers.get('Content-Length'),
-            'Accept-Ranges': 'bytes',
-            'Cache-Control': 'no-cache',
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, OPTIONS',
-            'Access-Control-Allow-Headers': 'Range, Origin, Accept-Encoding, Content-Type'
-        }
-        
-        return response.content, response.status_code, headers
-    except requests.RequestException as e:
-        logger.error(f"go2rtc HLS proxy error for {stream_name}: {e}")
-        return jsonify({'error': 'Failed to fetch HLS stream'}), 500
+        response = requests.post(f"{FFMPEG_SERVICE_HOST}/api/stream/{camera_id}/stop", timeout=10)
+        logger.info(f"Stopped FFmpeg stream for {camera_id} - Response: {response.status_code}")
+        return True  # Consider success if we get any response
+    except Exception as e:
+        logger.error(f"Error stopping FFmpeg stream for {camera_id}: {e}")
+        return False
 
-@app.route('/api/go2rtc/stream/<stream_name>/webrtc', methods=['GET'])
-def proxy_go2rtc_webrtc(stream_name):
-    """Proxy go2rtc WebRTC streams"""
+def update_ffmpeg_access(camera_id):
+    """Update access time for FFmpeg stream to keep it alive"""
     try:
-        # Build the go2rtc WebRTC URL - use the correct format
-        url = f"{GO2RTC_HOST}/api/stream.webrtc?src={stream_name}"
-        
-        # Stream the response from go2rtc
-        response = requests.get(url, stream=True, timeout=30)
-        response.raise_for_status()
-        
-        # Return the file with proper headers
-        headers = {
-            'Content-Type': response.headers.get('Content-Type', 'text/html'),
-            'Content-Length': response.headers.get('Content-Length'),
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, OPTIONS',
-            'Access-Control-Allow-Headers': 'Range, Origin, Accept-Encoding, Content-Type'
-        }
-        
-        return response.content, response.status_code, headers
-    except requests.RequestException as e:
-        logger.error(f"go2rtc WebRTC proxy error for {stream_name}: {e}")
-        return jsonify({'error': 'Failed to fetch WebRTC stream'}), 500
+        response = requests.post(f"{FFMPEG_SERVICE_HOST}/api/stream/{camera_id}/access", timeout=5)
+        logger.debug(f"Updated FFmpeg access time for {camera_id}")
+        return True  # Consider success if we get any response
+    except Exception as e:
+        logger.warning(f"Error updating FFmpeg access time for {camera_id}: {e}")
+        return False
 
-@app.route('/api/go2rtc/stream/<stream_name>/mjpeg', methods=['GET'])
-def proxy_go2rtc_mjpeg(stream_name):
-    """Proxy go2rtc MJPEG streams"""
+def get_ffmpeg_stream_status(camera_id):
+    """Get FFmpeg stream status for a camera"""
     try:
-        # Build the go2rtc MJPEG URL - use the correct format
-        url = f"{GO2RTC_HOST}/api/stream.mjpeg?src={stream_name}"
-        
-        # Stream the response from go2rtc
-        response = requests.get(url, stream=True, timeout=30)
-        response.raise_for_status()
-        
-        # Return the file with proper headers
-        headers = {
-            'Content-Type': response.headers.get('Content-Type', 'multipart/x-mixed-replace'),
-            'Content-Length': response.headers.get('Content-Length'),
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, OPTIONS',
-            'Access-Control-Allow-Headers': 'Range, Origin, Accept-Encoding, Content-Type'
-        }
-        
-        return response.content, response.status_code, headers
-    except requests.RequestException as e:
-        logger.error(f"go2rtc MJPEG proxy error for {stream_name}: {e}")
-        return jsonify({'error': 'Failed to fetch MJPEG stream'}), 500
+        response = requests.get(f"{FFMPEG_SERVICE_HOST}/api/stream/{camera_id}/status", timeout=5)
+        return True  # Consider running if we get any response
+    except Exception as e:
+        logger.warning(f"Error checking FFmpeg stream status for {camera_id}: {e}")
+        return False
 
-@app.route('/api/go2rtc/stream/<stream_name>/snapshot', methods=['GET'])
-def proxy_go2rtc_snapshot(stream_name):
-    """Proxy go2rtc snapshot"""
+def init_database():
+    """Initialize database with hardcoded user and security tables"""
     try:
-        # Build the go2rtc snapshot URL - use the correct format
-        url = f"{GO2RTC_HOST}/api/stream.snapshot?src={stream_name}"
+        conn = get_db_connection()
         
-        # Stream the response from go2rtc
-        response = requests.get(url, stream=True, timeout=10)
-        response.raise_for_status()
+        # Create users table if it doesn't exist
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                email TEXT,
+                full_name TEXT,
+                is_admin BOOLEAN DEFAULT 0,
+                is_active BOOLEAN DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP
+            )
+        ''')
         
-        # Return the file with proper headers
-        headers = {
-            'Content-Type': response.headers.get('Content-Type', 'image/jpeg'),
-            'Content-Length': response.headers.get('Content-Length'),
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, OPTIONS',
-            'Access-Control-Allow-Headers': 'Range, Origin, Accept-Encoding, Content-Type'
-        }
+        # Create login attempts table
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS login_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip_address VARCHAR(45) NOT NULL,
+                username VARCHAR(50),
+                success BOOLEAN NOT NULL DEFAULT FALSE,
+                attempt_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                user_agent TEXT
+            )
+        ''')
         
-        return response.content, response.status_code, headers
-    except requests.RequestException as e:
-        logger.error(f"go2rtc snapshot proxy error for {stream_name}: {e}")
-        return jsonify({'error': 'Failed to fetch snapshot'}), 500
-
-@app.route('/api/frigate/recordings/<camera_name>', methods=['GET'])
-def get_frigate_recordings(camera_name):
-    """Proxy Frigate recordings API"""
-    try:
-        # Get query parameters
-        before = request.args.get('before')
-        after = request.args.get('after')
+        # Create blocked IPs table
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS blocked_ips (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip_address VARCHAR(45) NOT NULL UNIQUE,
+                blocked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                blocked_until TIMESTAMP NOT NULL,
+                failed_attempts INTEGER NOT NULL,
+                reason VARCHAR(100) DEFAULT 'Too many failed login attempts'
+            )
+        ''')
         
-        # Build Frigate API URL
-        url = f"{FRIGATE_HOST}/api/{camera_name}/recordings"
-        params = {}
-        if before:
-            params['before'] = before
-        if after:
-            params['after'] = after
+        # Create indexes for performance
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_login_attempts_ip ON login_attempts(ip_address)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_login_attempts_time ON login_attempts(attempt_time)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_blocked_ips_address ON blocked_ips(ip_address)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_blocked_ips_until ON blocked_ips(blocked_until)')
+        
+        # Check if admin user exists
+        admin_username = os.getenv('ADMIN_USERNAME', 'admin')
+        user = conn.execute('SELECT id FROM users WHERE username = ?', (admin_username,)).fetchone()
+        
+        if not user:
+            # Create the default admin user from environment variables
+            admin_username = os.getenv('ADMIN_USERNAME', 'admin')
+            admin_password = os.getenv('ADMIN_PASSWORD', 'change-this-secure-password')
+            admin_email = os.getenv('ADMIN_EMAIL', 'admin@example.com')
+            admin_full_name = os.getenv('ADMIN_FULL_NAME', 'System Administrator')
             
-        # Make request to Frigate
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        
-        return jsonify(response.json())
-    except requests.RequestException as e:
-        logger.error(f"Frigate recordings API error: {e}")
-        return jsonify({'error': 'Failed to fetch recordings'}), 500
-
-@app.route('/api/frigate/events', methods=['GET'])
-def get_frigate_events():
-    """Proxy Frigate events API"""
-    try:
-        # Get query parameters
-        camera = request.args.get('camera')
-        before = request.args.get('before')
-        after = request.args.get('after')
-        limit = request.args.get('limit', '100')
-        
-        # Build Frigate API URL
-        url = f"{FRIGATE_HOST}/api/events"
-        params = {'limit': limit}
-        if camera:
-            params['camera'] = camera
-        if before:
-            params['before'] = before
-        if after:
-            params['after'] = after
-            
-        # Make request to Frigate
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        
-        return jsonify(response.json())
-    except requests.RequestException as e:
-        logger.error(f"Frigate events API error: {e}")
-        return jsonify({'error': 'Failed to fetch events'}), 500
-
-@app.route('/api/frigate/events/<event_id>/clip.mp4', methods=['GET'])
-def get_frigate_event_clip(event_id):
-    """Proxy Frigate event clip files"""
-    try:
-        # Build Frigate API URL for the specific event clip
-        url = f"{FRIGATE_HOST}/api/events/{event_id}/clip.mp4"
-        
-        # Stream the file from Frigate
-        response = requests.get(url, stream=True, timeout=30)
-        response.raise_for_status()
-        
-        # Return the file with proper headers
-        return response.content, response.status_code, {
-            'Content-Type': response.headers.get('Content-Type', 'video/mp4'),
-            'Content-Length': response.headers.get('Content-Length'),
-            'Accept-Ranges': 'bytes'
-        }
-    except requests.RequestException as e:
-        logger.error(f"Frigate event clip API error: {e}")
-        return jsonify({'error': 'Failed to fetch event clip'}), 500
-
-@app.route('/api/frigate/cameras', methods=['GET'])
-def get_frigate_cameras():
-    """Proxy Frigate cameras API - extract from config"""
-    try:
-        url = f"{FRIGATE_HOST}/api/config"
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        
-        config = response.json()
-        cameras = config.get('cameras', {})
-        
-        # Extract camera information
-        camera_list = []
-        for camera_name, camera_config in cameras.items():
-            camera_info = {
-                'name': camera_name,
-                'enabled': camera_config.get('enabled', True),
-                'live': camera_config.get('live', {}),
-                'detect': camera_config.get('detect', {}),
-                'record': camera_config.get('record', {}),
-                'snapshots': camera_config.get('snapshots', {}),
-                'ui': camera_config.get('ui', {})
-            }
-            camera_list.append(camera_info)
-        
-        return jsonify(camera_list)
-    except requests.RequestException as e:
-        logger.error(f"Frigate cameras API error: {e}")
-        return jsonify({'error': 'Failed to fetch cameras'}), 500
-
-@app.route('/api/frigate/recordings/<camera_name>/latest', methods=['GET'])
-def get_latest_recording(camera_name):
-    """Get the latest recording for a camera with thorough filesystem scanning"""
-    try:
-        # Get query parameter for minimum age (to avoid serving incomplete files)
-        min_age = request.args.get('min_age', '2', type=int)  # Default 2 seconds
-        
-        recording_dir = f"/media/frigate/recordings"
-        if not os.path.exists(recording_dir):
-            return jsonify({'error': 'No recent recordings found'}), 200
-        
-        # Find the most recent recording file with thorough scanning
-        latest_file = None
-        latest_time = 0
-        current_time = time.time()
-        
-        # Scan all date directories (last 7 days to be thorough)
-        date_dirs = sorted(os.listdir(recording_dir), reverse=True)[:7]
-        
-        for date_dir in date_dirs:
-            date_path = os.path.join(recording_dir, date_dir)
-            if not os.path.isdir(date_path):
-                continue
-                
-            # Scan all hour directories
-            hour_dirs = sorted(os.listdir(date_path), reverse=True)
-            
-            for hour_dir in hour_dirs:
-                hour_path = os.path.join(date_path, hour_dir)
-                if not os.path.isdir(hour_path):
-                    continue
-                    
-                # Check if camera directory exists
-                camera_path = os.path.join(hour_path, camera_name)
-                if not os.path.exists(camera_path):
-                    continue
-                    
-                # Find the most recent file in this directory
-                try:
-                    files = [f for f in os.listdir(camera_path) if f.endswith('.mp4')]
-                    files.sort(reverse=True)  # Most recent first
-                    
-                    for filename in files:
-                        file_path = os.path.join(camera_path, filename)
-                        
-                        # Check if file is complete (not being written)
-                        try:
-                            file_time = os.path.getmtime(file_path)
-                            file_size = os.path.getsize(file_path)
-                            
-                            # Skip files that are too recent (might be incomplete)
-                            if current_time - file_time < min_age:
-                                continue
-                                
-                            # Skip files that are too small (likely incomplete)
-                            if file_size < 1000:  # Less than 1KB
-                                continue
-                            
-                            if file_time > latest_time:
-                                latest_time = file_time
-                                latest_file = {
-                                    'file_path': f"{date_dir}/{hour_dir}/{camera_name}/{filename}",
-                                    'start_time': int(file_time),
-                                    'end_time': int(file_time) + 10,  # Assume 10 second duration
-                                    'duration': 10.0,
-                                    'motion': 0,
-                                    'objects': 0,
-                                    'segment_size': 6.0,
-                                    'id': f"{int(file_time)}.0-filesystem",
-                                    'file_size': file_size,
-                                    'age_seconds': int(current_time - file_time)
-                                }
-                                break  # Found the most recent file in this hour
-                        except (OSError, IOError) as e:
-                            logger.warning(f"Error accessing file {file_path}: {e}")
-                            continue
-                            
-                except (OSError, IOError) as e:
-                    logger.warning(f"Error reading directory {camera_path}: {e}")
-                    continue
-                    
-                # If we found a file in this hour, we can stop looking at older hours
-                if latest_file:
-                    break
-                    
-            # If we found a file in this date, we can stop looking at older dates
-            if latest_file:
-                break
-        
-        if latest_file:
-            logger.debug(f"Found latest recording for {camera_name}: {latest_file['file_path']} (age: {latest_file['age_seconds']}s)")
-            return jsonify(latest_file)
+            password_hash = bcrypt.hashpw(admin_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+            conn.execute('''
+                INSERT INTO users (username, password_hash, email, full_name, is_admin, is_active)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (admin_username, password_hash, admin_email, admin_full_name, True, True))
+            logger.info(f"Created default admin user: {admin_username}")
         else:
-            return jsonify({'error': 'No recent recordings found'}), 200
-            
-    except Exception as e:
-        logger.error(f"Error getting latest recording for {camera_name}: {e}")
-        return jsonify({'error': 'Failed to fetch latest recording'}), 500
-
-@app.route('/api/frigate/recordings/<camera_name>/<path:recording_path>', methods=['GET'])
-def serve_recording_file(camera_name, recording_path):
-    """Serve a specific recording file from Frigate"""
-    try:
-        # Build the full path to the recording file
-        # Frigate stores recordings in /media/frigate/recordings/
-        recording_dir = f"/media/frigate/recordings"
+            logger.info(f"Admin user {admin_username} already exists")
         
-        # The recording_path should be something like "2025-07-06/18/Living_Room/28.53.mp4"
-        full_path = os.path.join(recording_dir, recording_path)
-        
-        # Security check: ensure the path is within the recordings directory
-        if not os.path.abspath(full_path).startswith(os.path.abspath(recording_dir)):
-            return jsonify({'error': 'Invalid path'}), 400
-        
-        if not os.path.exists(full_path):
-            return jsonify({'error': 'Recording not found'}), 404
-        
-        # Serve the file with proper headers for video streaming
-        response = send_from_directory(
-            os.path.dirname(full_path),
-            os.path.basename(full_path)
-        )
-        
-        # Add headers for video streaming
-        response.headers['Content-Type'] = 'video/mp4'
-        response.headers['Accept-Ranges'] = 'bytes'
-        response.headers['Cache-Control'] = 'public, max-age=3600'
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
-        response.headers['Access-Control-Allow-Headers'] = 'Range, Origin, Accept-Encoding, Content-Type'
-        
-        return response
-    except Exception as e:
-        logger.error(f"Error serving recording file: {e}")
-        return jsonify({'error': 'Failed to serve recording'}), 500
-
-@app.route('/api/frigate/recordings/<camera_name>/list', methods=['GET'])
-def list_recordings(camera_name):
-    """List available recordings for a camera"""
-    try:
-        # Get query parameters
-        days = request.args.get('days', '1', type=int)
-        
-        # Calculate the date range using Unix timestamp
-        now = datetime.now()
-        after_timestamp = int((now - timedelta(days=days)).timestamp())
-        
-        url = f"{FRIGATE_HOST}/api/{camera_name}/recordings"
-        params = {'after': after_timestamp}
-        
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        
-        recordings = response.json()
-        
-        # Add file paths for easy access
-        for recording in recordings:
-            # Extract the file path from the recording data
-            if 'start_time' in recording:
-                start_time = datetime.fromtimestamp(recording['start_time'])
-                # Format: YYYY-MM-DD/HH/camera_name/filename.mp4
-                # The filename is based on the start_time (minute.second.mp4)
-                # Round down to the nearest 10-second interval
-                minute = start_time.minute
-                second = (start_time.second // 10) * 10  # Round down to nearest 10
-                filename = f"{minute:02d}.{second:02d}.mp4"
-                recording['file_path'] = f"{start_time.strftime('%Y-%m-%d')}/{start_time.strftime('%H')}/{camera_name}/{filename}"
-        
-        return jsonify(recordings)
-    except requests.RequestException as e:
-        logger.error(f"Frigate recordings list API error: {e}")
-        return jsonify({'error': 'Failed to fetch recordings list'}), 500
-
-@app.route('/api/frigate/recordings/<camera_name>/recent', methods=['GET'])
-def get_recent_recordings(camera_name):
-    """Get recent recordings for a camera with thorough filesystem scanning"""
-    try:
-        # Get query parameters
-        count = int(request.args.get('count', '6'))  # Default 6 recordings (1 minute buffer)
-        min_age = int(request.args.get('min_age', '2'))  # Default 2 seconds
-        
-        recording_dir = f"/media/frigate/recordings"
-        if not os.path.exists(recording_dir):
-            return jsonify([])
-        
-        recordings = []
-        current_time = time.time()
-        
-        # Scan all date directories (last 3 days to be thorough)
-        date_dirs = sorted(os.listdir(recording_dir), reverse=True)[:3]
-        
-        for date_dir in date_dirs:
-            if len(recordings) >= count:
-                break
-                
-            date_path = os.path.join(recording_dir, date_dir)
-            if not os.path.isdir(date_path):
-                continue
-                
-            # Scan all hour directories
-            hour_dirs = sorted(os.listdir(date_path), reverse=True)
-            
-            for hour_dir in hour_dirs:
-                if len(recordings) >= count:
-                    break
-                    
-                hour_path = os.path.join(date_path, hour_dir)
-                if not os.path.isdir(hour_path):
-                    continue
-                    
-                # Check if camera directory exists
-                camera_path = os.path.join(hour_path, camera_name)
-                if not os.path.exists(camera_path):
-                    continue
-                    
-                # Find recent files in this directory
-                try:
-                    files = [f for f in os.listdir(camera_path) if f.endswith('.mp4')]
-                    files.sort(reverse=True)  # Most recent first
-                    
-                    for filename in files:
-                        if len(recordings) >= count:
-                            break
-                            
-                        file_path = os.path.join(camera_path, filename)
-                        
-                        # Check if file is complete (not being written)
-                        try:
-                            file_time = os.path.getmtime(file_path)
-                            file_size = os.path.getsize(file_path)
-                            
-                            # Skip files that are too recent (might be incomplete)
-                            if current_time - file_time < min_age:
-                                continue
-                                
-                            # Skip files that are too small (likely incomplete)
-                            if file_size < 1000:  # Less than 1KB
-                                continue
-                            
-                            recording = {
-                                'file_path': f"{date_dir}/{hour_dir}/{camera_name}/{filename}",
-                                'start_time': int(file_time),
-                                'end_time': int(file_time) + 10,  # Assume 10 second duration
-                                'duration': 10.0,
-                                'motion': 0,
-                                'objects': 0,
-                                'segment_size': 6.0,
-                                'id': f"{int(file_time)}.0-filesystem",
-                                'file_size': file_size,
-                                'age_seconds': int(current_time - file_time)
-                            }
-                            
-                            recordings.append(recording)
-                            
-                        except (OSError, IOError) as e:
-                            logger.warning(f"Error accessing file {file_path}: {e}")
-                            continue
-                            
-                except (OSError, IOError) as e:
-                    logger.warning(f"Error reading directory {camera_path}: {e}")
-                    continue
-        
-        # Sort by start_time (most recent first) and return requested count
-        recordings.sort(key=lambda x: x['start_time'], reverse=True)
-        return jsonify(recordings[:count])
+        conn.commit()
+        conn.close()
         
     except Exception as e:
-        logger.error(f"Error getting recent recordings for {camera_name}: {e}")
-        return jsonify([])
+        logger.error(f"Database initialization error: {e}")
 
-@app.route('/api/frigate/recordings/<camera_name>/buffer', methods=['GET'])
-def get_buffered_recordings(camera_name):
-    """Get a 1-minute buffer of recordings for seamless streaming"""
-    try:
-        # Get query parameters
-        buffer_size = int(request.args.get('buffer_size', '6'))  # Default 6 recordings (1 minute)
-        min_age = int(request.args.get('min_age', '2'))  # Default 2 seconds
-        
-        recording_dir = f"/media/frigate/recordings"
-        if not os.path.exists(recording_dir):
-            return jsonify({'recordings': [], 'buffer_complete': False})
-        
-        recordings = []
-        current_time = time.time()
-        
-        # Scan all date directories (last 3 days to be thorough)
-        date_dirs = sorted(os.listdir(recording_dir), reverse=True)[:3]
-        
-        for date_dir in date_dirs:
-            if len(recordings) >= buffer_size:
-                break
-                
-            date_path = os.path.join(recording_dir, date_dir)
-            if not os.path.isdir(date_path):
-                continue
-                
-            # Scan all hour directories
-            hour_dirs = sorted(os.listdir(date_path), reverse=True)
-            
-            for hour_dir in hour_dirs:
-                if len(recordings) >= buffer_size:
-                    break
-                    
-                hour_path = os.path.join(date_path, hour_dir)
-                if not os.path.isdir(hour_path):
-                    continue
-                    
-                # Check if camera directory exists
-                camera_path = os.path.join(hour_path, camera_name)
-                if not os.path.exists(camera_path):
-                    continue
-                    
-                # Find recent files in this directory
-                try:
-                    files = [f for f in os.listdir(camera_path) if f.endswith('.mp4')]
-                    files.sort(reverse=True)  # Most recent first
-                    
-                    for filename in files:
-                        if len(recordings) >= buffer_size:
-                            break
-                            
-                        file_path = os.path.join(camera_path, filename)
-                        
-                        # Check if file is complete (not being written)
-                        try:
-                            file_time = os.path.getmtime(file_path)
-                            file_size = os.path.getsize(file_path)
-                            
-                            # Skip files that are too recent (might be incomplete)
-                            if current_time - file_time < min_age:
-                                continue
-                                
-                            # Skip files that are too small (likely incomplete)
-                            if file_size < 1000:  # Less than 1KB
-                                continue
-                            
-                            # Parse timestamp from filename (e.g., "00.40.mp4" -> 40 seconds)
-                            try:
-                                # Extract seconds from filename (remove .mp4 extension)
-                                seconds_str = filename.replace('.mp4', '')
-                                # Split by dot to get minutes and seconds
-                                if '.' in seconds_str:
-                                    minutes, seconds = seconds_str.split('.')
-                                    start_seconds = int(minutes) * 60 + int(seconds)
-                                else:
-                                    start_seconds = int(seconds_str)
-                                
-                                # Construct the full timestamp from date_dir, hour_dir, and start_seconds
-                                # date_dir format: "2025-07-01", hour_dir format: "18"
-                                date_obj = datetime.strptime(date_dir, "%Y-%m-%d")
-                                hour = int(hour_dir)
-                                # Create datetime object for the start of the hour
-                                hour_start = date_obj.replace(hour=hour, minute=0, second=0, microsecond=0)
-                                # Add the start_seconds to get the actual start time
-                                actual_start_time = hour_start + timedelta(seconds=start_seconds)
-                                start_timestamp = int(actual_start_time.timestamp())
-                                
-                            except (ValueError, AttributeError) as e:
-                                logger.warning(f"Failed to parse timestamp from filename {filename}: {e}")
-                                # Fall back to file modification time
-                                start_timestamp = int(file_time)
-                            
-                            recording = {
-                                'file_path': f"{date_dir}/{hour_dir}/{camera_name}/{filename}",
-                                'start_time': start_timestamp,
-                                'end_time': start_timestamp + 10,  # Assume 10 second duration
-                                'duration': 10.0,
-                                'motion': 0,
-                                'objects': 0,
-                                'segment_size': 6.0,
-                                'id': f"{start_timestamp}.0-filesystem",
-                                'file_size': file_size,
-                                'age_seconds': int(current_time - start_timestamp)
-                            }
-                            
-                            recordings.append(recording)
-                            
-                        except (OSError, IOError) as e:
-                            logger.warning(f"Error accessing file {file_path}: {e}")
-                            continue
-                            
-                except (OSError, IOError) as e:
-                    logger.warning(f"Error reading directory {camera_path}: {e}")
-                    continue
-        
-        # Sort by start_time (oldest first for chronological playback)
-        recordings.sort(key=lambda x: x['start_time'])
-        
-        # Check if we have a complete buffer
-        buffer_complete = len(recordings) >= buffer_size
-        
-        # If we have recordings, check if they form a continuous sequence
-        if recordings and len(recordings) > 1:
-            # Sort by start_time (oldest first for sequence checking)
-            sorted_recordings = sorted(recordings, key=lambda x: x['start_time'])
-            
-            # Check if recordings are sequential (within 15 seconds of each other)
-            for i in range(len(sorted_recordings) - 1):
-                current_end = sorted_recordings[i]['start_time'] + 10
-                next_start = sorted_recordings[i + 1]['start_time']
-                
-                # If gap is more than 15 seconds, buffer is incomplete
-                if next_start - current_end > 15:
-                    buffer_complete = False
-                    break
-        
-        return jsonify({
-            'recordings': recordings[:buffer_size],
-            'buffer_complete': buffer_complete,
-            'buffer_size': len(recordings),
-            'target_size': buffer_size
-        })
-        
-    except Exception as e:
-        logger.error(f"Error getting buffered recordings for {camera_name}: {e}")
-        return jsonify({'recordings': [], 'buffer_complete': False, 'error': str(e)})
+# Rate limiting configuration
+MAX_LOGIN_ATTEMPTS = 4
+BLOCK_DURATION_HOURS = 1
 
-# --- HLS Proxy for Frontyard and Backyard (via go2rtc in Frigate) ---
-from requests.auth import HTTPBasicAuth
-
-@app.route('/api/proxy/hls/frontyard/<path:subpath>', methods=['GET'])
-def proxy_hls_frontyard(subpath):
-    """Proxy HLS playlist and segments for Frontyard_main via go2rtc"""
-    return proxy_hls_stream('Frontyard_main', subpath)
-
-@app.route('/api/proxy/hls/backyard/<path:subpath>', methods=['GET'])
-def proxy_hls_backyard(subpath):
-    """Proxy HLS playlist and segments for Backyard_main via go2rtc"""
-    return proxy_hls_stream('Backyard_main', subpath)
-
-
-def proxy_hls_stream(stream_name, subpath):
-    # Build the go2rtc HLS URL (Frigate's internal go2rtc)
-    # Example: http://frigate:1984/api/stream.m3u8?src=Frontyard_main
-    # For segments: http://frigate:1984/api/stream.m3u8?src=Frontyard_main&segment=... (handled by go2rtc)
-    go2rtc_base = os.environ.get('GO2RTC_HOST', 'http://frigate:1984')
-    # Determine if this is the playlist or a segment
-    if subpath.endswith('.m3u8'):
-        url = f"{go2rtc_base}/api/stream.m3u8?src={stream_name}"
+def get_client_ip():
+    """Get client IP address, handling proxies and load balancers"""
+    # Check for forwarded IP from reverse proxy
+    if 'X-Forwarded-For' in request.headers:
+        return request.headers['X-Forwarded-For'].split(',')[0].strip()
+    elif 'X-Real-IP' in request.headers:
+        return request.headers['X-Real-IP']
     else:
-        # For .ts segments, go2rtc uses the same endpoint with segment param
-        url = f"{go2rtc_base}/api/stream.m3u8?src={stream_name}&segment={subpath}"
-    # Use HTTP Basic Auth if required (not usually needed for Frigate's go2rtc)
-    auth = HTTPBasicAuth('Dakota', '#Dakman7214') if 'go2rtc' in go2rtc_base else None
+        return request.environ.get('REMOTE_ADDR', '127.0.0.1')
+
+def cleanup_expired_blocks():
+    """Clean up expired IP blocks and old login attempts"""
     try:
-        r = requests.get(url, timeout=15, auth=auth)
-        r.raise_for_status()
+        conn = get_db_connection()
         
-        # Debug logging
-        logger.debug(f"HLS proxy for {stream_name}: status={r.status_code}, content_length={len(r.content)}, content={repr(r.text[:200])}")
+        # Remove expired blocks
+        conn.execute('DELETE FROM blocked_ips WHERE blocked_until < CURRENT_TIMESTAMP')
         
-        # Set appropriate content type
-        if subpath.endswith('.m3u8'):
-            content_type = 'application/vnd.apple.mpegurl'
-        elif subpath.endswith('.ts'):
-            content_type = 'video/MP2T'
-        else:
-            content_type = r.headers.get('Content-Type', 'application/octet-stream')
+        # Clean up old login attempts (older than 24 hours)
+        conn.execute('''
+            DELETE FROM login_attempts 
+            WHERE attempt_time < datetime('now', '-24 hours')
+        ''')
         
-        # Return the response directly with proper headers
-        response = Response(r.content, content_type=content_type)
-        response.headers['Access-Control-Allow-Origin'] = '*'
-        response.headers['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
-        response.headers['Access-Control-Allow-Headers'] = 'Range, Origin, Accept-Encoding, Content-Type'
-        response.headers['Cache-Control'] = 'no-cache'
-        return response
-    except requests.RequestException as e:
-        logger.error(f"HLS proxy error for {stream_name}: {e}")
-        return jsonify({'error': f'Failed to fetch HLS stream for {stream_name}'}), 502
+        conn.commit()
+        conn.close()
+        
+    except Exception as e:
+        logger.error(f"Error cleaning up expired blocks: {e}")
 
-def get_db():
-    """Get database connection"""
-    db = sqlite3.connect(app.config['DATABASE'])
-    db.row_factory = sqlite3.Row
-    return db
+def is_ip_blocked(ip_address):
+    """Check if an IP address is currently blocked"""
+    try:
+        conn = get_db_connection()
+        blocked = conn.execute('''
+            SELECT id FROM blocked_ips 
+            WHERE ip_address = ? AND blocked_until > CURRENT_TIMESTAMP
+        ''', (ip_address,)).fetchone()
+        conn.close()
+        
+        return blocked is not None
+        
+    except Exception as e:
+        logger.error(f"Error checking blocked IP: {e}")
+        return False
 
-def init_db():
-    """Initialize database with schema"""
-    with app.app_context():
-        db = get_db()
-        with open('database_schema.sql', 'r') as f:
-            db.executescript(f.read())
-        db.commit()
-        db.close()
+def get_failed_attempts_count(ip_address, hours=1):
+    """Get count of failed login attempts from an IP in the last N hours"""
+    try:
+        conn = get_db_connection()
+        count = conn.execute('''
+            SELECT COUNT(*) as count FROM login_attempts 
+            WHERE ip_address = ? 
+            AND success = FALSE 
+            AND attempt_time > datetime('now', '-{} hours')
+        '''.format(hours), (ip_address,)).fetchone()
+        conn.close()
+        
+        return count['count'] if count else 0
+        
+    except Exception as e:
+        logger.error(f"Error getting failed attempts count: {e}")
+        return 0
 
-def token_required(f):
-    """Decorator to require JWT token"""
+def record_login_attempt(ip_address, username, success, user_agent=None):
+    """Record a login attempt"""
+    try:
+        conn = get_db_connection()
+        conn.execute('''
+            INSERT INTO login_attempts (ip_address, username, success, user_agent)
+            VALUES (?, ?, ?, ?)
+        ''', (ip_address, username, success, user_agent))
+        conn.commit()
+        conn.close()
+        
+    except Exception as e:
+        logger.error(f"Error recording login attempt: {e}")
+
+def block_ip(ip_address, failed_attempts):
+    """Block an IP address for the configured duration"""
+    try:
+        conn = get_db_connection()
+        
+        # Calculate block expiry time
+        block_until = datetime.utcnow() + timedelta(hours=BLOCK_DURATION_HOURS)
+        
+        # Insert or update the block
+        conn.execute('''
+            INSERT OR REPLACE INTO blocked_ips 
+            (ip_address, blocked_until, failed_attempts, reason)
+            VALUES (?, ?, ?, ?)
+        ''', (ip_address, block_until, failed_attempts, f'Too many failed login attempts ({failed_attempts})'))
+        
+        conn.commit()
+        conn.close()
+        
+        logger.warning(f"Blocked IP {ip_address} for {BLOCK_DURATION_HOURS} hours after {failed_attempts} failed attempts")
+        
+    except Exception as e:
+        logger.error(f"Error blocking IP {ip_address}: {e}")
+
+def check_rate_limit(ip_address, username):
+    """Check if the IP should be rate limited and handle blocking"""
+    # Clean up expired blocks first
+    cleanup_expired_blocks()
+    
+    # Check if IP is already blocked
+    if is_ip_blocked(ip_address):
+        return False, "IP address is temporarily blocked due to too many failed login attempts"
+    
+    # Get failed attempts count
+    failed_count = get_failed_attempts_count(ip_address, hours=1)
+    
+    # If we're at the limit, this attempt will put us over
+    if failed_count >= MAX_LOGIN_ATTEMPTS:
+        return False, f"Too many failed login attempts. Please try again in {BLOCK_DURATION_HOURS} hour(s)"
+    
+    return True, None
+
+# Initialize database on startup
+init_database()
+
+def auth_required(f):
+    """Decorator to require authentication"""
     @wraps(f)
     def decorated(*args, **kwargs):
+        # Check for token in Authorization header first
         token = request.headers.get('Authorization')
+        if token and token.startswith('Bearer '):
+            token = token[7:]
+        else:
+            # For streaming endpoints, also check query parameters
+            token = request.args.get('token')
+        
         if not token:
             return jsonify({'error': 'Token is missing'}), 401
         
         try:
-            token = token.split(' ')[1]  # Remove 'Bearer ' prefix
-            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-            db = get_db()
-            user = db.execute('SELECT * FROM users WHERE id = ?', (data['user_id'],)).fetchone()
-            if not user:
-                return jsonify({'error': 'Invalid token'}), 401
-            request.current_user = user
-        except Exception as e:
-            return jsonify({'error': 'Invalid token'}), 401
-        
-        return f(*args, **kwargs)
-    return decorated
+            payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+            current_user_id = payload['user_id']
+            
+            # Fetch user details from the database
+            conn = get_db_connection()
+            user = conn.execute('SELECT id, username, is_admin FROM users WHERE id = ?', (current_user_id,)).fetchone()
+            conn.close()
 
-def admin_required(f):
-    """Decorator to require admin privileges"""
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if not hasattr(request, 'current_user') or not request.current_user['is_admin']:
-            return jsonify({'error': 'Admin privileges required'}), 403
-        return f(*args, **kwargs)
+            if not user:
+                return jsonify({'error': 'User not found'}), 401
+
+            # Update last login timestamp
+            conn = get_db_connection()
+            conn.execute('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?', (current_user_id,))
+            conn.commit()
+            conn.close()
+
+        except jwt.ExpiredSignatureError:
+            return jsonify({'error': 'Token has expired'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'error': 'Token is invalid'}), 401
+        
+        return f(current_user_id, *args, **kwargs)
     return decorated
 
 # Authentication endpoints
 @app.route('/api/auth/login', methods=['POST'])
 def login():
-    data = request.get_json()
-    username = data.get('username')
-    password = data.get('password')
+    """User login endpoint with rate limiting"""
+    client_ip = get_client_ip()
+    user_agent = request.headers.get('User-Agent', '')
+    username = None
     
-    if not username or not password:
-        return jsonify({'error': 'Username and password required'}), 400
-    
-    db = get_db()
-    user = db.execute('SELECT * FROM users WHERE username = ? AND is_active = 1', (username,)).fetchone()
-    
-    if user and bcrypt.checkpw(password.encode('utf-8'), user['password_hash'].encode('utf-8')):
+    try:
+        data = request.get_json()
+        username = data.get('username')
+        password = data.get('password')
+        
+        if not username or not password:
+            return jsonify({'error': 'Username and password are required'}), 400
+        
+        # Check rate limiting before processing login
+        rate_limit_ok, rate_limit_message = check_rate_limit(client_ip, username)
+        if not rate_limit_ok:
+            logger.warning(f"Rate limit exceeded for IP {client_ip}, username: {username}")
+            return jsonify({'error': rate_limit_message}), 429
+        
+        conn = get_db_connection()
+        user = conn.execute('SELECT id, username, password_hash, is_admin, is_active FROM users WHERE username = ?', (username,)).fetchone()
+        conn.close()
+
+        # Check if user exists and is active
+        if not user or not user['is_active']:
+            # Record failed attempt
+            record_login_attempt(client_ip, username, False, user_agent)
+            
+            # Check if we need to block this IP
+            failed_count = get_failed_attempts_count(client_ip, hours=1)
+            if failed_count >= MAX_LOGIN_ATTEMPTS:
+                block_ip(client_ip, failed_count)
+                return jsonify({'error': f'Too many failed attempts. IP blocked for {BLOCK_DURATION_HOURS} hour(s)'}), 429
+            
+            remaining_attempts = MAX_LOGIN_ATTEMPTS - failed_count
+            return jsonify({
+                'error': 'Invalid credentials',
+                'attempts_remaining': remaining_attempts
+            }), 401
+
+        # Verify password
+        if not verify_password(password, user['password_hash']):
+            # Record failed attempt
+            record_login_attempt(client_ip, username, False, user_agent)
+            
+            # Check if we need to block this IP
+            failed_count = get_failed_attempts_count(client_ip, hours=1)
+            if failed_count >= MAX_LOGIN_ATTEMPTS:
+                block_ip(client_ip, failed_count)
+                return jsonify({'error': f'Too many failed attempts. IP blocked for {BLOCK_DURATION_HOURS} hour(s)'}), 429
+            
+            remaining_attempts = MAX_LOGIN_ATTEMPTS - failed_count
+            return jsonify({
+                'error': 'Invalid credentials',
+                'attempts_remaining': remaining_attempts
+            }), 401
+
+        # Successful login
+        record_login_attempt(client_ip, username, True, user_agent)
+        
+        token = create_token(user['id'])
+        
         # Update last login
-        db.execute('UPDATE users SET last_login = ? WHERE id = ?', (datetime.now(), user['id']))
+        conn = get_db_connection()
+        conn.execute('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?', (user['id'],))
+        conn.commit()
+        conn.close()
         
-        # Create session token
-        token = jwt.encode({
-            'user_id': user['id'],
-            'username': user['username'],
-            'exp': datetime.utcnow() + timedelta(days=7)
-        }, app.config['SECRET_KEY'], algorithm='HS256')
-        
-        # Store session
-        db.execute('''
-            INSERT INTO user_sessions (user_id, session_token, device_info, ip_address, expires_at)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (user['id'], token, request.headers.get('User-Agent'), request.remote_addr, 
-              datetime.utcnow() + timedelta(days=7)))
-        db.commit()
+        logger.info(f"Successful login for user {username} from IP {client_ip}")
         
         return jsonify({
             'token': token,
             'user': {
                 'id': user['id'],
                 'username': user['username'],
-                'full_name': user['full_name'],
-                'is_admin': user['is_admin']
+                'is_admin': bool(user['is_admin'])
             }
         })
-    
-    return jsonify({'error': 'Invalid credentials'}), 401
+        
+    except Exception as e:
+        logger.error(f"Login error for IP {client_ip}, username {username}: {e}")
+        # Record failed attempt even for server errors
+        if username:
+            record_login_attempt(client_ip, username, False, user_agent)
+        return jsonify({'error': 'Login failed'}), 500
 
 @app.route('/api/auth/logout', methods=['POST'])
-@token_required
-def logout():
-    token = request.headers.get('Authorization').split(' ')[1]
-    db = get_db()
-    db.execute('DELETE FROM user_sessions WHERE session_token = ?', (token,))
-    db.commit()
+@auth_required
+def logout(current_user_id):
+    """User logout endpoint"""
+    # In a more complete implementation, you'd invalidate the token
+    # For now, just return success
     return jsonify({'message': 'Logged out successfully'})
 
-# User management endpoints
-@app.route('/api/users', methods=['GET'])
-@token_required
-def get_users():
-    db = get_db()
-    users = db.execute('''
-        SELECT u.id, u.username, u.email, u.full_name, u.is_admin, u.is_active, u.created_at, u.last_login
-        FROM users u
-        JOIN user_households uh ON u.id = uh.user_id
-        JOIN user_households current_user_household ON current_user_household.user_id = ?
-        WHERE uh.household_id = current_user_household.household_id
-    ''', (request.current_user['id'],)).fetchall()
-    
-    return jsonify([dict(user) for user in users])
-
-@app.route('/api/users', methods=['POST'])
-@token_required
-@admin_required
-def create_user():
-    data = request.get_json()
-    
-    # Validate required fields
-    required_fields = ['username', 'email', 'password', 'full_name']
-    for field in required_fields:
-        if not data.get(field):
-            return jsonify({'error': f'{field} is required'}), 400
-    
-    # Hash password
-    password_hash = bcrypt.hashpw(data['password'].encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-    
-    db = get_db()
+@app.route('/api/auth/me', methods=['GET'])
+@auth_required
+def get_current_user(current_user_id):
+    """Get current user information"""
     try:
-        # Get current user's household
-        household = db.execute('''
-            SELECT household_id FROM user_households WHERE user_id = ?
-        ''', (request.current_user['id'],)).fetchone()
-        
-        # Create user
-        cursor = db.execute('''
-            INSERT INTO users (username, email, password_hash, full_name, is_admin)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (data['username'], data['email'], password_hash, data['full_name'], data.get('is_admin', False)))
-        
-        user_id = cursor.lastrowid
-        
-        # Add user to household
-        db.execute('''
-            INSERT INTO user_households (user_id, household_id, role)
-            VALUES (?, ?, ?)
-        ''', (user_id, household['household_id'], data.get('role', 'member')))
-        
-        db.commit()
-        return jsonify({'message': 'User created successfully', 'user_id': user_id}), 201
-        
-    except sqlite3.IntegrityError:
-        return jsonify({'error': 'Username or email already exists'}), 400
+        conn = get_db_connection()
+        user = conn.execute('SELECT username, email, full_name, is_admin FROM users WHERE id = ?', (current_user_id,)).fetchone()
+        conn.close()
 
-# Device management endpoints
-@app.route('/api/devices', methods=['GET'])
-@token_required
-def get_devices():
-    db = get_db()
-    devices = db.execute('''
-        SELECT id, device_name, device_type, is_active, last_seen, created_at
-        FROM devices WHERE user_id = ?
-    ''', (request.current_user['id'],)).fetchall()
-    
-    return jsonify([dict(device) for device in devices])
+        if not user:
+            return jsonify({'error': 'User not found'}), 500
 
-@app.route('/api/devices', methods=['POST'])
-@token_required
-def register_device():
-    data = request.get_json()
-    
-    required_fields = ['device_name', 'device_type', 'push_token']
-    for field in required_fields:
-        if not data.get(field):
-            return jsonify({'error': f'{field} is required'}), 400
-    
-    db = get_db()
-    cursor = db.execute('''
-        INSERT INTO devices (user_id, device_name, device_type, push_token, fcm_token)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (request.current_user['id'], data['device_name'], data['device_type'], 
-          data['push_token'], data.get('fcm_token')))
-    
-    db.commit()
-    return jsonify({'message': 'Device registered successfully', 'device_id': cursor.lastrowid}), 201
+        return jsonify({
+            'user': {
+                'id': current_user_id,
+                'username': user['username'],
+                'email': user['email'],
+                'full_name': user['full_name'],
+                'is_admin': bool(user['is_admin'])
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Get user error: {e}")
+        return jsonify({'error': 'Failed to get user information'}), 500
 
-# Frigate API integration
+@app.route('/api/go2rtc/streams', methods=['GET'])
+@auth_required
+def get_go2rtc_streams(current_user_id):
+    """Get go2rtc stream information"""
+    try:
+        response = requests.get(f"{GO2RTC_HOST}/api/streams", timeout=10)
+        response.raise_for_status()
+        return jsonify(response.json())
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch go2rtc streams: {e}")
+        return jsonify({'error': 'Failed to fetch stream information'}), 500
+
+@app.route('/api/stream-buffer/status', methods=['GET'])
+@auth_required
+def get_stream_buffer_status(current_user_id):
+    """Get stream buffer status"""
+    try:
+        buffer = get_stream_buffer()
+        status = buffer.get_status()
+        return jsonify(status)
+    except Exception as e:
+        logger.error(f"Failed to get stream buffer status: {e}")
+        return jsonify({'error': 'Failed to get buffer status'}), 500
+
+
+
+@app.route('/api/cameras/<camera_id>/stream/mse', methods=['GET'])
+@auth_required
+def get_camera_mse_stream(current_user_id, camera_id):
+    """Get MSE stream URL for a camera"""
+    try:
+        camera_stream_mapping = {
+            'frontyard': 'Frontyard_live',
+            'backyard': 'Backyard_live',
+            'living_room': 'Living_Room_live',
+            'nursery': 'Nursery_live'
+        }
+
+        stream_name = camera_stream_mapping.get(camera_id.lower())
+        if not stream_name:
+            return jsonify({'error': f'Unknown camera: {camera_id}'}), 404
+
+        mse_url = f"/api/go2rtc/mse/{stream_name}"
+
+        return jsonify({
+            'camera_id': camera_id,
+            'stream_name': stream_name,
+            'mse_url': mse_url,
+            'type': 'mse'
+        })
+
+    except Exception as e:
+        logger.error(f"Failed to get MSE stream for {camera_id}: {e}")
+        return jsonify({'error': 'Failed to get MSE stream'}), 500
+
+
+
+@app.route('/api/go2rtc/mse/<stream_name>', methods=['GET'])
+@auth_required
+def proxy_go2rtc_mse(current_user_id, stream_name):
+    """Proxy go2rtc MSE streams with proper connection cleanup and mobile optimization"""
+    try:
+        url = f"{GO2RTC_HOST}/api/stream.mp4?src={stream_name}"
+
+        headers = {
+            'Accept': 'video/mp4',
+            'Range': request.headers.get('Range', 'bytes=0-')
+        }
+
+        session = requests.Session()
+
+        try:
+            # Stream the response from go2rtc with longer timeout for NVENC transcoding
+            response = session.get(url, headers=headers, stream=True, timeout=60)
+            response.raise_for_status()
+
+            return_headers = {
+                'Content-Type': response.headers.get('Content-Type', 'video/mp4'),
+                'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+                'Pragma': 'no-cache',
+                'Expires': '0',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, OPTIONS',
+                'Access-Control-Allow-Headers': 'Range, Origin, Accept-Encoding, Content-Type',
+                'Access-Control-Expose-Headers': 'Content-Length, Content-Range',
+                'X-Content-Type-Options': 'nosniff',
+                'X-Frame-Options': 'DENY'
+            }
+
+            if 'Content-Range' in response.headers:
+                return_headers['Content-Range'] = response.headers['Content-Range']
+            if 'Content-Length' in response.headers:
+                return_headers['Content-Length'] = response.headers['Content-Length']
+            if 'Accept-Ranges' in response.headers:
+                return_headers['Accept-Ranges'] = response.headers['Accept-Ranges']
+
+            def generate():
+                try:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            yield chunk
+                except Exception as e:
+                    logger.error(f"Error streaming MSE data for {stream_name}: {e}")
+                finally:
+                    try:
+                        response.close()
+                        session.close()
+                    except:
+                        pass
+
+            return Response(generate(), status=response.status_code, headers=return_headers)
+
+        except Exception as e:
+            try:
+                session.close()
+            except:
+                pass
+            raise e
+
+    except requests.RequestException as e:
+        logger.error(f"MSE proxy error for {stream_name}: {e}")
+        return jsonify({'error': 'Failed to fetch MSE stream'}), 500
+
+# WebRTC endpoints removed - now using MP4 streaming for better iOS compatibility
+
+# All WebRTC proxy endpoints removed - using MP4 streaming only
+
+# WebRTC subscription endpoints removed - MP4 streaming doesn't require subscriptions
+
 @app.route('/api/cameras', methods=['GET'])
-@token_required
-def get_cameras():
-    """Get cameras from Frigate API with cached snapshots"""
+@auth_required
+def get_cameras(current_user_id):
+    """Get camera list - now requires authentication"""
+    return get_authenticated_cameras(current_user_id)
+
+@app.route('/api/cameras/start-streaming', methods=['POST'])
+@auth_required
+def start_all_camera_streaming(current_user_id):
+    """Start on-demand streaming for all cameras when client accesses multiview"""
     try:
-        # Check if we need to refresh snapshots (every hour)
-        force_refresh = request.args.get('refresh', 'false').lower() == 'true'
+        # Get camera list
+        response = requests.get(f"{FRIGATE_HOST}/api/config", timeout=10)
+        response.raise_for_status()
+        config = response.json()
         
-        response = requests.get(f'{FRIGATE_HOST}/api/config')
-        if response.status_code == 200:
-            config = response.json()
-            cameras = []
-            
-            for camera_id, camera_config in config.get('cameras', {}).items():
-                # Generate URLs for different stream types
-                # Use public snapshot endpoint to avoid authentication issues
-                snapshot_url = f'/api/public/camera/{camera_id}/snapshot'
-                # Remove go2rtc stream URLs
-                cameras.append({
-                    'id': camera_id,
-                    'name': camera_config.get('name', camera_id),
-                    'enabled': camera_config.get('enabled', True),
-                    'snapshot_url': snapshot_url,
-                    'live_streams': {},
-                    'last_updated': datetime.now().isoformat()
-                })
+        cameras = config.get('cameras', {})
+        started_streams = []
+        failed_streams = []
+        
+        for camera_name in cameras.keys():
+            camera_id = camera_name.lower()  # Convert to lowercase for FFmpeg service
+            if start_ffmpeg_stream(camera_id):
+                started_streams.append(camera_id)
+                # Also ensure go2rtc stream is active
+                buffer = get_stream_buffer()
+                buffer.ensure_stream_active(f"{camera_name}_live")
+            else:
+                failed_streams.append(camera_id)
+        
+        logger.info(f"Started streaming for {len(started_streams)} cameras: {started_streams}")
+        if failed_streams:
+            logger.warning(f"Failed to start streaming for {len(failed_streams)} cameras: {failed_streams}")
+        
+        return jsonify({
+            'status': 'success',
+            'started_streams': started_streams,
+            'failed_streams': failed_streams,
+            'message': f'Started streaming for {len(started_streams)} cameras'
+        })
+        
+    except Exception as e:
+        logger.error(f"Error starting camera streaming: {e}")
+        return jsonify({'error': 'Failed to start camera streaming'}), 500
+
+@app.route('/api/cameras/stop-streaming', methods=['POST'])
+@auth_required  
+def stop_all_camera_streaming(current_user_id):
+    """Stop on-demand streaming for all cameras when client leaves multiview"""
+    try:
+        # Get camera list
+        response = requests.get(f"{FRIGATE_HOST}/api/config", timeout=10)
+        response.raise_for_status()
+        config = response.json()
+        
+        cameras = config.get('cameras', {})
+        stopped_streams = []
+        
+        for camera_name in cameras.keys():
+            camera_id = camera_name.lower()  # Convert to lowercase for FFmpeg service
+            if stop_ffmpeg_stream(camera_id):
+                stopped_streams.append(camera_id)
+        
+        logger.info(f"Stopped streaming for {len(stopped_streams)} cameras: {stopped_streams}")
+        
+        return jsonify({
+            'status': 'success',
+            'stopped_streams': stopped_streams,
+            'message': f'Stopped streaming for {len(stopped_streams)} cameras'
+        })
+        
+    except Exception as e:
+        logger.error(f"Error stopping camera streaming: {e}")
+        return jsonify({'error': 'Failed to stop camera streaming'}), 500
+
+@app.route('/api/cameras/<camera_id>/start-stream', methods=['POST'])
+@auth_required
+def start_single_camera_stream(current_user_id, camera_id):
+    """Start streaming for a single camera"""
+    try:
+        if start_ffmpeg_stream(camera_id.lower()):
+            # Also ensure go2rtc stream is active
+            buffer = get_stream_buffer()
+            buffer.ensure_stream_active(f"{camera_id}_live")
             
             return jsonify({
-                'cameras': cameras,
-                'refresh_available': True,
-                'next_refresh': (datetime.now() + timedelta(hours=1)).isoformat()
+                'status': 'success',
+                'camera': camera_id,
+                'message': f'Started streaming for {camera_id}'
             })
         else:
-            return jsonify({'error': 'Failed to fetch cameras from Frigate'}), 500
+            return jsonify({
+                'status': 'error',
+                'camera': camera_id,
+                'message': f'Failed to start streaming for {camera_id}'
+            }), 500
+            
     except Exception as e:
-        return jsonify({'error': f'Error connecting to Frigate: {str(e)}'}), 500
+        logger.error(f"Error starting stream for {camera_id}: {e}")
+        return jsonify({'error': f'Failed to start stream for {camera_id}'}), 500
+
+@app.route('/api/cameras/<camera_id>/keep-alive', methods=['POST'])
+@auth_required
+def keep_camera_stream_alive(current_user_id, camera_id):
+    """Keep camera stream alive by updating access time"""
+    try:
+        # Update FFmpeg stream access time
+        ffmpeg_updated = update_ffmpeg_access(camera_id.lower())
+        
+        # Update go2rtc stream access time
+        buffer = get_stream_buffer()
+        buffer.ensure_stream_active(f"{camera_id}_live")
+        
+        return jsonify({
+            'status': 'success',
+            'camera': camera_id,
+            'ffmpeg_updated': ffmpeg_updated,
+            'message': f'Updated access time for {camera_id}'
+        })
+        
+    except Exception as e:
+        logger.error(f"Error keeping stream alive for {camera_id}: {e}")
+        return jsonify({'error': f'Failed to keep stream alive for {camera_id}'}), 500
 
 @app.route('/api/public/cameras', methods=['GET'])
 def get_public_cameras():
-    """Get cameras from Frigate API (public endpoint, no authentication required)"""
+    """Get camera list for public access - DEPRECATED, use /api/cameras instead"""
+    # This endpoint should be deprecated in favor of authenticated access
+    # For now, return a limited response
+    return jsonify({'error': 'Authentication required', 'message': 'Please use /api/cameras with authentication'}), 401
+
+def get_authenticated_cameras(current_user_id):
+    """Get camera list for authenticated users"""
     try:
-        response = requests.get(f'{FRIGATE_HOST}/api/config')
-        if response.status_code == 200:
-            config = response.json()
-            cameras = []
-            
-            for camera_id, camera_config in config.get('cameras', {}).items():
-                # Generate URLs for different stream types
-                snapshot_url = f'/api/public/camera/{camera_id}/snapshot'
-                # Remove go2rtc stream URLs
-                cameras.append({
-                    'id': camera_id,
-                    'name': camera_config.get('name', camera_id),
-                    'enabled': camera_config.get('enabled', True),
+        # Get Frigate config
+        response = requests.get(f"{FRIGATE_HOST}/api/config", timeout=10)
+        response.raise_for_status()
+        config = response.json()
+
+        cameras = []
+        if 'cameras' in config:
+            for camera_name, camera_config in config['cameras'].items():
+                # Use correct snapshot endpoint (no /api prefix since frontend adds it)
+                snapshot_url = f"/camera/{camera_name}/snapshot"
+
+                camera_data = {
+                    'id': camera_name,
+                    'name': camera_name.replace('_', ' ').title(),
                     'snapshot_url': snapshot_url,
-                    'live_streams': {},
-                    'last_updated': datetime.now().isoformat()
-                })
-            
+                    # Provide both MP4 and HLS for adaptive streaming
+                    'mp4_url': f'/api/camera/{camera_name}/stream.mp4',
+                    'hls_url': f'/api/camera/{camera_name}/stream.m3u8',
+                    # Additional streaming format info for frontend
+                    'adaptive_urls': {
+                        'mp4': f'/api/camera/{camera_name}/stream.mp4',
+                        'hls': f'/api/camera/{camera_name}/stream.m3u8'
+                    }
+                }
+                
+                logger.info(f"Generated camera config for {camera_name}: {camera_data}")
+                cameras.append(camera_data)
+
+            # Pre-activate streams to ensure they're ready for frontend
+            buffer = get_stream_buffer()
+            for camera_data in cameras:
+                stream_name = f"{camera_data['id']}_live"
+                buffer.ensure_stream_active(stream_name)
+                logger.debug(f"Pre-activated stream: {stream_name}")
+
+            logger.info(f"Returning {len(cameras)} cameras to frontend with pre-activated streams")
             return jsonify({
-                'cameras': cameras,
-                'refresh_available': True,
-                'next_refresh': (datetime.now() + timedelta(hours=1)).isoformat()
+                'cameras': cameras
             })
         else:
-            return jsonify({'error': 'Failed to fetch cameras from Frigate'}), 500
-    except Exception as e:
-        return jsonify({'error': f'Error connecting to Frigate: {str(e)}'}), 500
+            logger.warning("No cameras found in Frigate config")
+            return jsonify({'cameras': []}), 200
 
-@app.route('/api/public/stream/<camera_id>', methods=['GET'])
-def get_public_stream(camera_id):
-    """Proxy endpoint for camera streams to hide actual URLs (public endpoint, no authentication required)"""
-    try:
-        # Remove go2rtc redirect logic
-        return jsonify({'error': 'Live streaming is not available.'}), 404
     except Exception as e:
-        return jsonify({'error': f'Error accessing stream: {str(e)}'}), 500
+        logger.error(f"Error getting cameras: {e}")
+        return jsonify({'error': 'Failed to get camera list'}), 500
 
-@app.route('/api/events', methods=['GET'])
-@token_required
-def get_events():
-    """Get events from Frigate API"""
+@app.route('/api/camera/<camera_id>/stream.mp4', methods=['GET'])
+def get_camera_mp4_stream(camera_id):
+    """Get authenticated MP4 stream for a camera - supports both header and query token auth"""
     try:
-        # Get events from the last 24 hours
-        end_time = datetime.now().isoformat()
-        start_time = (datetime.now() - timedelta(days=1)).isoformat()
-        
-        response = requests.get(f'{FRIGATE_HOST}/api/events', params={
-            'start_time': start_time,
-            'end_time': end_time,
-            'limit': 50
-        })
-        
-        if response.status_code == 200:
-            events = response.json()
-            return jsonify(events)
+        # Check for token in Authorization header first
+        token = request.headers.get('Authorization')
+        if token and token.startswith('Bearer '):
+            token = token[7:]
         else:
-            return jsonify({'error': 'Failed to fetch events from Frigate'}), 500
-    except Exception as e:
-        return jsonify({'error': f'Error fetching events: {str(e)}'}), 500
-
-# System status endpoint
-@app.route('/api/system/status', methods=['GET'])
-@token_required
-def get_system_status():
-    """Get system status including Frigate and storage info"""
-    try:
-        # Get Frigate status
-        frigate_status = requests.get(f'{FRIGATE_HOST}/api/stats').json()
+            # For video elements, check query parameters
+            token = request.args.get('token')
         
-        # Get storage info (you'll need to implement this based on your setup)
-        storage_info = {
-            'total_space': 1000000000000,  # 1TB in bytes
-            'used_space': 500000000000,    # 500GB in bytes
-            'free_space': 500000000000     # 500GB in bytes
+        if not token:
+            return jsonify({'error': 'Authentication required'}), 401
+        
+        # Validate the token
+        try:
+            payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+            current_user_id = payload['user_id']
+            logger.info(f"Video stream authenticated for user {current_user_id}")
+        except jwt.ExpiredSignatureError:
+            return jsonify({'error': 'Token expired'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'error': 'Invalid token'}), 401
+        # Map camera ID to stream name
+        stream_name = f"{camera_id}_live"
+        
+        # Build go2rtc URL
+        go2rtc_url = f"{GO2RTC_HOST}/api/stream.mp4?src={stream_name}"
+        
+        # Add any query parameters from the original request (like cache buster)
+        if request.query_string:
+            go2rtc_url += f"&{request.query_string.decode()}"
+        
+        # FORCE desktop User-Agent to prevent go2rtc mobile redirects
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+            'Accept': request.headers.get('Accept', '*/*'),
+            'Range': request.headers.get('Range', '')
         }
         
-        return jsonify({
-            'frigate': frigate_status,
-            'storage': storage_info,
-            'timestamp': datetime.now().isoformat()
-        })
+        # Remove empty headers
+        headers = {k: v for k, v in headers.items() if v}
+        
+        logger.info(f"Proxying authenticated MP4 stream: {camera_id} -> {stream_name}")
+        
+        # Stream the response from go2rtc
+        response = requests.get(go2rtc_url, headers=headers, stream=True, timeout=30)
+        response.raise_for_status()
+        
+        # Return streaming response with proper headers
+        def generate():
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
+        
+        # Build response headers, excluding empty ones
+        response_headers = {
+            'Content-Type': response.headers.get('Content-Type', 'video/mp4'),
+            'Accept-Ranges': 'bytes',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Expose-Headers': 'Accept-Ranges, Content-Length, Content-Range',
+            'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+            'X-Content-Type-Options': 'nosniff'
+        }
+        
+        # Only add Content-Length and Content-Range if they exist
+        if response.headers.get('Content-Length'):
+            response_headers['Content-Length'] = response.headers.get('Content-Length')
+        if response.headers.get('Content-Range'):
+            response_headers['Content-Range'] = response.headers.get('Content-Range')
+            
+        return Response(
+            generate(),
+            status=response.status_code,
+            headers=response_headers
+        )
+        
+    except requests.RequestException as e:
+        logger.error(f"MP4 stream proxy error for {camera_id}: {e}")
+        return jsonify({'error': 'Stream unavailable'}), 503
     except Exception as e:
-        return jsonify({'error': f'Error fetching system status: {str(e)}'}), 500
+        logger.error(f"Unexpected MP4 stream error for {camera_id}: {e}")
+        return jsonify({'error': 'Stream failed'}), 500
 
-# Notification preferences
-@app.route('/api/notifications/preferences', methods=['GET'])
-@token_required
-def get_notification_preferences():
-    db = get_db()
-    preferences = db.execute('''
-        SELECT camera_id, event_type, notification_type, is_enabled
-        FROM notification_preferences WHERE user_id = ?
-    ''', (request.current_user['id'],)).fetchall()
-    
-    return jsonify([dict(pref) for pref in preferences])
+@app.route('/api/camera/<camera_id>/stream.m3u8', methods=['GET'])
+def get_camera_hls_playlist(camera_id):
+    """Get authenticated HLS playlist for a camera - served from FFmpeg-generated files"""
+    try:
+        # Check for token in Authorization header first
+        token = request.headers.get('Authorization')
+        if token and token.startswith('Bearer '):
+            token = token[7:]
+        else:
+            # For video elements, check query parameters
+            token = request.args.get('token')
+        
+        if not token:
+            return jsonify({'error': 'Authentication required'}), 401
+        
+        # Validate the token
+        try:
+            payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+            current_user_id = payload['user_id']
+            logger.info(f"HLS playlist authenticated for user {current_user_id}")
+        except jwt.ExpiredSignatureError:
+            return jsonify({'error': 'Token expired'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'error': 'Invalid token'}), 401
+        
+        # Map camera ID to directory name (convert to lowercase, keep underscores)
+        camera_lowercase = camera_id.lower()
+        
+        # Try to update FFmpeg access time (best effort)
+        try:
+            update_ffmpeg_access(camera_lowercase)
+        except:
+            pass  # Ignore FFmpeg service API issues
+        
+        # Map camera ID to directory name (convert to lowercase, keep underscores)
+        camera_dir = camera_lowercase
+        playlist_path = os.path.join(HLS_SEGMENTS_PATH, camera_dir, 'playlist.m3u8')
+        
+        # Check if playlist file exists (wait up to 10 seconds for it to appear)
+        max_wait = 10
+        wait_count = 0
+        while not os.path.exists(playlist_path) and wait_count < max_wait:
+            time.sleep(1)
+            wait_count += 1
+        
+        if not os.path.exists(playlist_path):
+            logger.error(f"HLS playlist not found after {max_wait}s: {playlist_path}")
+            return jsonify({'error': 'Stream not ready yet, please try again in a few seconds'}), 503
+        
+        logger.info(f"Serving HLS playlist for {camera_id}: {playlist_path}")
+        
+        # Read playlist and modify segment URLs to include authentication
+        try:
+            with open(playlist_path, 'r') as f:
+                playlist_content = f.read()
+            
+            # Modify segment URLs to include token
+            lines = playlist_content.split('\n')
+            modified_lines = []
+            
+            for line in lines:
+                if line.endswith('.ts'):
+                    # Add authentication token to segment URL
+                    auth_url = f"/api/camera/{camera_id}/hls/{line}?token={token}"
+                    modified_lines.append(auth_url)
+                else:
+                    modified_lines.append(line)
+            
+            modified_playlist = '\n'.join(modified_lines)
+            
+            # Return playlist with proper headers
+            response_headers = {
+                'Content-Type': 'application/vnd.apple.mpegurl',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Expose-Headers': 'Content-Length',
+                'Cache-Control': 'no-cache, no-store, must-revalidate, max-age=0',
+                'Pragma': 'no-cache',
+                'Expires': '0'
+            }
+            
+            return Response(
+                modified_playlist,
+                status=200,
+                headers=response_headers
+            )
+            
+        except IOError as e:
+            logger.error(f"Error reading HLS playlist {playlist_path}: {e}")
+            return jsonify({'error': 'Failed to read playlist'}), 500
+        
+    except Exception as e:
+        logger.error(f"Unexpected HLS playlist error for {camera_id}: {e}")
+        return jsonify({'error': 'HLS playlist failed'}), 500
 
-@app.route('/api/notifications/preferences', methods=['POST'])
-@token_required
-def update_notification_preferences():
-    data = request.get_json()
-    
-    db = get_db()
-    db.execute('''
-        INSERT OR REPLACE INTO notification_preferences 
-        (user_id, camera_id, event_type, notification_type, is_enabled)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (request.current_user['id'], data.get('camera_id'), data.get('event_type'),
-          data.get('notification_type', 'push'), data.get('is_enabled', True)))
-    
-    db.commit()
-    return jsonify({'message': 'Preferences updated successfully'})
+@app.route('/api/camera/<camera_id>/hls/<segment>', methods=['GET'])
+def get_camera_hls_segment(camera_id, segment):
+    """Get authenticated HLS segment for a camera - served from FFmpeg-generated files"""
+    try:
+        # Check for token in Authorization header first
+        token = request.headers.get('Authorization')
+        if token and token.startswith('Bearer '):
+            token = token[7:]
+        else:
+            # For segment requests, check query parameters
+            token = request.args.get('token')
+        
+        if not token:
+            return jsonify({'error': 'Authentication required'}), 401
+        
+        # Validate the token
+        try:
+            payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+            current_user_id = payload['user_id']
+        except jwt.ExpiredSignatureError:
+            return jsonify({'error': 'Token expired'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'error': 'Invalid token'}), 401
+        
+        # Update FFmpeg access time to keep stream alive
+        camera_lowercase = camera_id.lower()
+        update_ffmpeg_access(camera_lowercase)
+        
+        # Security: Only allow .ts files and basic filename validation
+        if not segment.endswith('.ts') or '/' in segment or '..' in segment:
+            logger.warning(f"Invalid segment request: {segment}")
+            return jsonify({'error': 'Invalid segment'}), 400
+        
+        # Map camera ID to directory name (convert to lowercase)
+        camera_dir = camera_lowercase
+        segment_path = os.path.join(HLS_SEGMENTS_PATH, camera_dir, segment)
+        
+        # Check if segment file exists
+        if not os.path.exists(segment_path):
+            logger.warning(f"HLS segment not found: {segment_path}")
+            return jsonify({'error': 'Segment not found'}), 404
+        
+        logger.debug(f"Serving HLS segment for {camera_id}: {segment}")
+        
+        # Serve the segment file directly
+        response_headers = {
+            'Content-Type': 'video/mp2t',  # MPEG-2 Transport Stream
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Expose-Headers': 'Accept-Ranges, Content-Length',
+            'Cache-Control': 'no-cache, no-store, must-revalidate, max-age=0',
+            'Accept-Ranges': 'bytes'
+        }
+        
+        return send_file(
+            segment_path,
+            mimetype='video/mp2t',
+            as_attachment=False,
+            conditional=True  # Support range requests
+        )
+        
+    except Exception as e:
+        logger.error(f"Unexpected HLS segment error for {camera_id}/{segment}: {e}")
+        return jsonify({'error': 'HLS segment failed'}), 500
 
-# Health check endpoint (no authentication required)
+@app.route('/api/camera/<camera_id>/snapshot', methods=['GET'])
+@auth_required  
+def get_camera_snapshot(current_user_id, camera_id):
+    """Get latest snapshot for a camera - requires authentication"""
+    try:
+        # Get snapshot from Frigate - use correct API endpoint
+        response = requests.get(f"{FRIGATE_HOST}/api/{camera_id}/latest.jpg", timeout=10)
+        response.raise_for_status()
+
+        # Add security headers
+        headers = {
+            'Content-Type': 'image/jpeg',
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'X-Content-Type-Options': 'nosniff'
+        }
+
+        return Response(response.content, headers=headers)
+
+    except requests.RequestException as e:
+        logger.error(f"Error getting snapshot for {camera_id}: {e}")
+        return jsonify({'error': 'Failed to get camera snapshot'}), 500
+
+@app.route('/api/public/camera/<camera_id>/snapshot', methods=['GET'])
+def get_public_camera_snapshot(camera_id):
+    """DEPRECATED: Use /api/camera/<camera_id>/snapshot with authentication"""
+    return jsonify({'error': 'Authentication required', 'message': 'Please use /api/camera/<camera_id>/snapshot with authentication'}), 401
+
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Simple health check endpoint for Docker"""
-    try:
-        # Test database connection
-        db = get_db()
-        db.execute('SELECT 1').fetchone()
-        db.close()
-        
-        # Test Frigate connection
-        response = requests.get(f'{FRIGATE_HOST}/api/config', timeout=5)
-        frigate_status = 'healthy' if response.status_code == 200 else 'unhealthy'
-        
-        # Get memory usage if available
-        memory_info = {}
-        if PSUTIL_AVAILABLE:
-            process = psutil.Process()
-            memory_info = process.memory_info()
-            memory_mb = round(memory_info.rss / 1024 / 1024, 2)
-        else:
-            memory_mb = None
-        
-        return jsonify({
-            'status': 'healthy',
-            'database': 'connected',
-            'frigate': frigate_status,
-            'memory_mb': memory_mb,
-            'cache_entries': len(API_CACHE),
-            'timestamp': datetime.now().isoformat()
-        }), 200
-    except Exception as e:
-        return jsonify({
-            'status': 'unhealthy',
-            'error': str(e),
-            'timestamp': datetime.now().isoformat()
-        }), 500
+    """Health check endpoint"""
+    return jsonify({'status': 'healthy'}), 200
 
-@app.route('/api/system/memory', methods=['GET'])
-def get_memory_usage():
-    """Get detailed memory usage information"""
+# Admin endpoints for security management
+@app.route('/api/admin/security/blocked-ips', methods=['GET'])
+@auth_required
+def get_blocked_ips(current_user_id):
+    """Get list of blocked IP addresses (admin only)"""
     try:
-        if not PSUTIL_AVAILABLE:
-            return jsonify({
-                'error': 'Memory monitoring not available (psutil not installed)',
-                'cache': {
-                    'entries': len(API_CACHE),
-                    'ttl_seconds': CACHE_TTL
-                }
-            }), 503
+        # Check if user is admin
+        conn = get_db_connection()
+        user = conn.execute('SELECT is_admin FROM users WHERE id = ?', (current_user_id,)).fetchone()
         
-        process = psutil.Process()
-        memory_info = process.memory_info()
+        if not user or not user['is_admin']:
+            conn.close()
+            return jsonify({'error': 'Admin access required'}), 403
         
-        return jsonify({
-            'process_memory': {
-                'rss_mb': round(memory_info.rss / 1024 / 1024, 2),
-                'vms_mb': round(memory_info.vms / 1024 / 1024, 2),
-                'percent': round(process.memory_percent(), 2)
-            },
-            'system_memory': {
-                'total_mb': round(psutil.virtual_memory().total / 1024 / 1024, 2),
-                'available_mb': round(psutil.virtual_memory().available / 1024 / 1024, 2),
-                'percent': round(psutil.virtual_memory().percent, 2)
-            },
-            'cache': {
-                'entries': len(API_CACHE),
-                'ttl_seconds': CACHE_TTL
-            }
-        })
+        # Get blocked IPs
+        blocked_ips = conn.execute('''
+            SELECT ip_address, blocked_at, blocked_until, failed_attempts, reason
+            FROM blocked_ips 
+            WHERE blocked_until > CURRENT_TIMESTAMP
+            ORDER BY blocked_at DESC
+        ''').fetchall()
+        
+        conn.close()
+        
+        blocked_list = []
+        for ip in blocked_ips:
+            blocked_list.append({
+                'ip_address': ip['ip_address'],
+                'blocked_at': ip['blocked_at'],
+                'blocked_until': ip['blocked_until'],
+                'failed_attempts': ip['failed_attempts'],
+                'reason': ip['reason']
+            })
+        
+        return jsonify({'blocked_ips': blocked_list})
+        
     except Exception as e:
-        logger.error(f"Memory usage check failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Error getting blocked IPs: {e}")
+        return jsonify({'error': 'Failed to get blocked IPs'}), 500
+
+@app.route('/api/admin/security/unblock-ip', methods=['POST'])
+@auth_required
+def unblock_ip(current_user_id):
+    """Unblock an IP address (admin only)"""
+    try:
+        # Check if user is admin
+        conn = get_db_connection()
+        user = conn.execute('SELECT is_admin FROM users WHERE id = ?', (current_user_id,)).fetchone()
+        
+        if not user or not user['is_admin']:
+            conn.close()
+            return jsonify({'error': 'Admin access required'}), 403
+        
+        data = request.get_json()
+        ip_address = data.get('ip_address')
+        
+        if not ip_address:
+            conn.close()
+            return jsonify({'error': 'IP address is required'}), 400
+        
+        # Remove the IP from blocked list
+        result = conn.execute('DELETE FROM blocked_ips WHERE ip_address = ?', (ip_address,))
+        conn.commit()
+        conn.close()
+        
+        if result.rowcount > 0:
+            logger.info(f"Admin unblocked IP: {ip_address}")
+            return jsonify({'message': f'IP {ip_address} has been unblocked'})
+        else:
+            return jsonify({'error': 'IP address not found in blocked list'}), 404
+        
+    except Exception as e:
+        logger.error(f"Error unblocking IP: {e}")
+        return jsonify({'error': 'Failed to unblock IP'}), 500
+
+@app.route('/api/admin/security/login-attempts', methods=['GET'])
+@auth_required
+def get_login_attempts(current_user_id):
+    """Get recent login attempts (admin only)"""
+    try:
+        # Check if user is admin
+        conn = get_db_connection()
+        user = conn.execute('SELECT is_admin FROM users WHERE id = ?', (current_user_id,)).fetchone()
+        
+        if not user or not user['is_admin']:
+            conn.close()
+            return jsonify({'error': 'Admin access required'}), 403
+        
+        # Get recent login attempts (last 24 hours)
+        attempts = conn.execute('''
+            SELECT ip_address, username, success, attempt_time, user_agent
+            FROM login_attempts 
+            WHERE attempt_time > datetime('now', '-24 hours')
+            ORDER BY attempt_time DESC
+            LIMIT 100
+        ''').fetchall()
+        
+        conn.close()
+        
+        attempts_list = []
+        for attempt in attempts:
+            attempts_list.append({
+                'ip_address': attempt['ip_address'],
+                'username': attempt['username'],
+                'success': bool(attempt['success']),
+                'attempt_time': attempt['attempt_time'],
+                'user_agent': attempt['user_agent']
+            })
+        
+        return jsonify({'login_attempts': attempts_list})
+        
+    except Exception as e:
+        logger.error(f"Error getting login attempts: {e}")
+        return jsonify({'error': 'Failed to get login attempts'}), 500
+
+
+
+
+
+@app.route('/api/go2rtc/mse/<stream_name>', methods=['OPTIONS'])
+def cors_preflight_mse(stream_name):
+    """Handle CORS preflight requests for MSE streams"""
+    headers = {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, OPTIONS',
+        'Access-Control-Allow-Headers': 'Range, Origin, Accept-Encoding, Content-Type, Authorization',
+        'Access-Control-Max-Age': '86400',
+    }
+    return '', 204, headers
+
+@app.teardown_appcontext
+def shutdown_session(exception=None):
+    """Clean up database connections"""
+    pass
+
+def cleanup():
+    """Clean up resources when app shuts down"""
+    shutdown_stream_buffer()
+
+import atexit
+import threading
+import time
+
+def periodic_cleanup():
+    """Periodically clean up expired blocks and old login attempts"""
+    while True:
+        try:
+            cleanup_expired_blocks()
+            time.sleep(3600)  # Run every hour
+        except Exception as e:
+            logger.error(f"Error in periodic cleanup: {e}")
+            time.sleep(60)  # Wait 1 minute before retrying
+
+# Start background cleanup thread
+cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
+cleanup_thread.start()
+
+atexit.register(cleanup)
 
 if __name__ == '__main__':
-    # Initialize database if it doesn't exist
-    if not os.path.exists(app.config['DATABASE']):
-        init_db()
-    
-    app.run(host='0.0.0.0', port=5003, debug=True)
+    # Disable debug mode in production
+    debug_mode = os.getenv('FLASK_DEBUG', 'false').lower() == 'true'
+    app.run(host='0.0.0.0', port=5003, debug=debug_mode)

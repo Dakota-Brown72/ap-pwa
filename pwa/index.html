@@ -2,9 +2,48 @@
 <html lang="en" data-theme="anchorpoint">
   <head>
     <meta charset="UTF-8" />
+    
+    <!-- Viewport Configuration - iOS 18.5 Optimized -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    
+    <!-- PWA Manifest -->
+    <link rel="manifest" href="/manifest.json" />
+    
+    <!-- Standard Icons -->
     <link rel="icon" type="image/ico" href="/icons/ico-48x48.ico" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AnchorPoint Systems</title>
+    <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192x192.png" />
+    <link rel="icon" type="image/png" sizes="512x512" href="/icons/icon-512x512.png" />
+    
+    <!-- iOS-Specific PWA Meta Tags -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="AnchorPoint" />
+    <meta name="apple-touch-fullscreen" content="yes" />
+    
+    <!-- iOS Touch Icons -->
+    <link rel="apple-touch-icon" href="/icons/icon-192x192.png" />
+    <link rel="apple-touch-icon" sizes="152x152" href="/icons/icon-192x192.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/icons/icon-192x192.png" />
+    <link rel="apple-touch-icon" sizes="167x167" href="/icons/icon-192x192.png" />
+    
+    <!-- iOS 18.5+ PWA Features -->
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="application-name" content="AnchorPoint" />
+    
+    <!-- Security and Performance -->
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+    <meta name="format-detection" content="telephone=no" />
+    
+    <!-- Theme Colors -->
+    <meta name="theme-color" content="#E8E4DD" />
+    <meta name="msapplication-TileColor" content="#1a1a1a" />
+    
+    <!-- Preload Critical Resources for iOS -->
+    <link rel="preload" href="/src/main.js" as="script" />
+    <link rel="dns-prefetch" href="//api.anchorpoint.local" />
+    
+    <title>AnchorPoint Security System</title>
   </head>
   <body>
     <div id="app"></div>

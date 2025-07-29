@@ -14,10 +14,14 @@ frigate/media/recordings/
 frigate/media/exports/
 frigate/media/lost+found/
 
-# Model cache files (large TensorRT models)
+# Model cache files and Frigate backup files (contain sensitive RTSP URLs)
 frigate/config/model_cache/
 frigate/config/backup.db
 frigate/config/backup_config.yaml
+frigate/config/*.backup
+frigate/config/*.bak
+frigate/config/frigate.db*
+frigate/config/.jwt_secret*
 
 # Log files
 *.log
@@ -27,9 +31,11 @@ netdata/data/
 # Environment files with secrets
 .env
 env.example
+config.env
 
 # Docker volumes and data
 caddy/data/
+caddy/config/
 mosquitto/data/
 netdata/data/
 
@@ -76,3 +82,22 @@ Thumbs.db
 # Backup files
 *.backup
 backup_* 
+
+# Test and development directories
+Test/
+yolov7_env/
+
+# HLS streaming segments (large, temporary)
+hls-segments/
+
+# Runtime configuration files
+frigate/config/go2rtc*
+offer.json
+filtered_offer.json
+
+# Netdata configuration (auto-generated)
+netdata-kickstart.sh
+netdata/config/custom_check_mergerfs.sh
+netdata/config/health.d/
+netdata/config/netdata/
+netdata/config/python.d/ 

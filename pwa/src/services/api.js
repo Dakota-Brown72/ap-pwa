@@ -1,5 +1,6 @@
 // API service for communicating with Flask backend
-const API_BASE_URL = 'http://localhost:5003/api';
+// Use relative URL to work with Vite proxy for network access
+const API_BASE_URL = '/api';
 
 class ApiService {
   constructor() {
@@ -34,15 +35,40 @@ class ApiService {
       const response = await fetch(url, config);
       
       if (!response.ok) {
-        if (response.status === 401) {
-          // Token expired or invalid
-          this.clearToken();
-          throw new Error('Authentication required');
+        // Try to get error details from response
+        let errorData = null;
+        try {
+          errorData = await response.json();
+        } catch (e) {
+          // Response is not JSON
         }
-        throw new Error(`API request failed: ${response.status}`);
+
+        if (response.status === 401) {
+          // Token expired or invalid (but not for login endpoint)
+          if (endpoint !== '/auth/login') {
+            this.clearToken();
+            // Redirect to login page
+            if (typeof window !== 'undefined' && window.location.pathname !== '/login') {
+              window.location.href = '/login';
+            }
+            throw new Error('Authentication required');
+          }
+        }
+        
+        // Create enhanced error with response data
+        const error = new Error(errorData?.error || `API request failed: ${response.status}`);
+        error.status = response.status;
+        error.data = errorData;
+        throw error;
       }
 
-      return await response.json();
+      // Handle different response types
+      const contentType = response.headers.get('Content-Type');
+      if (contentType && contentType.includes('image/')) {
+        return response; // Return the response object for blob handling
+      } else {
+        return await response.json();
+      }
     } catch (error) {
       console.error('API request error:', error);
       throw error;
@@ -70,14 +96,65 @@ class ApiService {
 
   // Cameras
   async getCameras() {
-    // Use public endpoint for now to avoid authentication issues
-    return await this.request('/public/cameras');
+    return this.request('/cameras');
   }
 
-  async getSnapshots(refresh = false) {
-    const url = refresh ? '/cameras/snapshots?refresh=true' : '/cameras/snapshots';
-    return await this.request(url);
+  // Public endpoint that doesn't require authentication
+  async getPublicCameras() {
+    const url = `${API_BASE_URL}/public/cameras`;
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`API request failed: ${response.status}`);
+      }
+      return await response.json();
+    } catch (error) {
+      console.error('API request error:', error);
+      throw error;
+    }
   }
+
+  // Optimized streaming endpoints for hardware-accelerated on-demand streams
+  async getCameraStream(cameraId, streamType = 'hls') {
+    // Get optimized stream URL for a camera with hardware acceleration
+    return await this.request(`/cameras/${cameraId}/stream/${streamType}`);
+  }
+
+  getCameraHlsUrl(cameraId) {
+    // Get direct HLS URL for a camera (hardware-accelerated, on-demand)
+    return `/api/cameras/${cameraId}/stream/hls`;
+  }
+
+  getCameraMseUrl(cameraId) {
+    // Get direct MSE/MP4 URL for a camera (best browser compatibility)
+    return `${API_BASE_URL}/cameras/${cameraId}/stream/mse`;
+  }
+
+  getDirectMp4Url(streamName) {
+    // Get direct MP4 URL from go2rtc for mobile compatibility
+    return `/api/go2rtc/stream.mp4?src=${streamName}`;
+  }
+
+  // Authenticated stream URLs
+  getAuthenticatedMp4Url(cameraId) {
+    // Get authenticated MP4 stream URL with token
+    const token = this.token;
+    if (!token) {
+      throw new Error('No authentication token available');
+    }
+    return `/api/camera/${cameraId}/stream.mp4?token=${encodeURIComponent(token)}`;
+  }
+
+  getAuthenticatedHlsUrl(cameraId) {
+    // Get authenticated HLS stream URL with token
+    const token = this.token;
+    if (!token) {
+      throw new Error('No authentication token available');
+    }
+    return `/api/camera/${cameraId}/stream.m3u8?token=${encodeURIComponent(token)}`;
+  }
+
+
 
   // Events
   async getEvents() {

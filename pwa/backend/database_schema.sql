@@ -96,6 +96,26 @@ CREATE TABLE event_logs (
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
 );
 
+-- Login attempts tracking for rate limiting
+CREATE TABLE login_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip_address VARCHAR(45) NOT NULL,
+    username VARCHAR(50),
+    success BOOLEAN NOT NULL DEFAULT FALSE,
+    attempt_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    user_agent TEXT
+);
+
+-- IP blocking table
+CREATE TABLE blocked_ips (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip_address VARCHAR(45) NOT NULL UNIQUE,
+    blocked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    blocked_until TIMESTAMP NOT NULL,
+    failed_attempts INTEGER NOT NULL,
+    reason VARCHAR(100) DEFAULT 'Too many failed login attempts'
+);
+
 -- Indexes for performance
 CREATE INDEX idx_users_email ON users(email);
 CREATE INDEX idx_users_username ON users(username);
@@ -106,6 +126,10 @@ CREATE INDEX idx_user_sessions_token ON user_sessions(session_token);
 CREATE INDEX idx_user_sessions_expires ON user_sessions(expires_at);
 CREATE INDEX idx_event_logs_user_id ON event_logs(user_id);
 CREATE INDEX idx_event_logs_created_at ON event_logs(created_at);
+CREATE INDEX idx_login_attempts_ip ON login_attempts(ip_address);
+CREATE INDEX idx_login_attempts_time ON login_attempts(attempt_time);
+CREATE INDEX idx_blocked_ips_address ON blocked_ips(ip_address);
+CREATE INDEX idx_blocked_ips_until ON blocked_ips(blocked_until);
 
 -- Insert default household
 INSERT INTO households (name) VALUES ('Default Household');

@@ -5,7 +5,8 @@
     <div class="mb-8 flex flex-col md:flex-row md:items-end md:justify-between gap-2">
       <div>
         <h1 class="text-3xl font-bold text-primary-content mb-1">AnchorPoint Dashboard</h1>
-        <p class="text-base-content text-opacity-70">Your security at a glance</p>
+        <p class="text-base-content text-opacity-70">Your system at a glance</p>
+        <!-- Removed last update and next refresh info -->
       </div>
       <button 
         @click="refreshSnapshots" 
@@ -14,7 +15,7 @@
       >
         <span v-if="loading" class="loading loading-spinner loading-xs"></span>
         <span v-else>↻</span>
-        Refresh
+        Refresh Now
       </button>
     </div>
 
@@ -33,22 +34,15 @@
               class="relative group rounded-xl overflow-hidden shadow-lg bg-base-100 hover:shadow-2xl transition-shadow cursor-pointer"
               @click="viewMultiview"
             >
-              <img 
-                :src="getSnapshotImage(camera.id)" 
-                :alt="`${camera.name} snapshot`" 
-                class="w-full h-56 object-cover transition-transform group-hover:scale-105 duration-200"
-                @error="handleImageError"
-              />
-              <!-- Overlay: Camera name and time -->
-              <div class="absolute bottom-0 left-0 w-full bg-gradient-to-t from-black/70 to-transparent p-3 flex flex-col gap-1">
-                <span class="text-lg font-semibold text-white drop-shadow">{{ camera.name }}</span>
-                <span v-if="getSnapshotInfo(camera.id)" class="text-xs text-gray-200 opacity-80">
-                  Last updated: {{ formatTimestamp(getSnapshotInfo(camera.id).timestamp) }}
-                </span>
-                <span v-if="getSnapshotInfo(camera.id) && getSnapshotInfo(camera.id).label" class="badge badge-accent badge-sm mt-1 self-start">
-                  {{ getSnapshotInfo(camera.id).label }}
-                </span>
+              <div class="aspect-video bg-base-300">
+                <img 
+                  :src="getSnapshotImage(camera.id)" 
+                  :alt="`${camera.name} snapshot`" 
+                  class="w-full h-full object-contain transition-transform group-hover:scale-105 duration-200"
+                  @error="handleImageError"
+                />
               </div>
+              <!-- Removed all overlays: camera name, last updated, and offline badge -->
             </div>
           </div>
         </div>
@@ -114,7 +108,12 @@
             <h2 class="card-title text-base-content mb-2">Quick Actions</h2>
             <div class="flex flex-wrap gap-2">
               <router-link to="/multiview" class="btn btn-primary btn-sm flex items-center gap-1">
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 10l4.553-2.276A2 2 0 0021 6.382V5a2 2 0 00-2-2H5a2 2 0 00-2 2v1.382a2 2 0 001.447 1.342L9 10m6 0v10a2 2 0 01-2 2H7a2 2 0 01-2-2V10m6 0h6"/></svg>
+                <!-- Replaced with a simple camera icon -->
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+                  <rect x="3" y="7" width="18" height="13" rx="2" ry="2"/>
+                  <circle cx="12" cy="13.5" r="3.5"/>
+                  <path d="M8 7V5a2 2 0 012-2h4a2 2 0 012 2v2"/>
+                </svg>
                 Live View
               </router-link>
               <router-link to="/review" class="btn btn-accent btn-sm flex items-center gap-1">
@@ -143,6 +142,8 @@ export default {
       loading: false,
       cameras: [],
       snapshots: {},
+      autoRefreshInterval: null,
+      lastRefreshTime: null,
       events: [
         { id: 1, type: 'Motion', description: 'Backyard motion detected', time: '10:15 AM' },
         { id: 2, type: 'Person', description: 'Front door visitor', time: '9:30 AM' },
@@ -153,25 +154,85 @@ export default {
   
   async mounted() {
     await this.loadData();
+    this.startAutoRefresh();
+  },
+  
+  beforeUnmount() {
+    this.stopAutoRefresh();
+    this.cleanupBlobUrls();
   },
   
   methods: {
+    cleanupBlobUrls() {
+      // Clean up blob URLs to prevent memory leaks
+      Object.values(this.snapshots).forEach(snapshot => {
+        if (snapshot.image && snapshot.image.startsWith('blob:')) {
+          URL.revokeObjectURL(snapshot.image);
+        }
+      });
+    },
+    
     async loadData(refresh = false) {
       try {
         this.loading = true;
         
-        // Load cameras and snapshots in parallel
-        const [camerasResponse, snapshotsResponse] = await Promise.all([
-          apiService.getCameras(),
-          apiService.getSnapshots(refresh)
-        ]);
+        // Clean up old blob URLs
+        this.cleanupBlobUrls();
         
+        // Load cameras using authenticated endpoint
+        const camerasResponse = await apiService.getCameras();
         this.cameras = camerasResponse.cameras || [];
-        this.snapshots = snapshotsResponse.snapshots || {};
+        
+        // Fetch authenticated snapshots and convert to blob URLs
+        this.snapshots = {};
+        const snapshotPromises = this.cameras.map(async (camera) => {
+          if (camera.snapshot_url) {
+            try {
+              // Fetch snapshot with authentication
+              const response = await apiService.request(`${camera.snapshot_url}${refresh ? `?t=${Date.now()}` : ''}`, {
+                headers: {
+                  'Accept': 'image/jpeg,image/png,image/*'
+                }
+              });
+              
+              // Convert response to blob URL
+              const blob = await response.blob();
+              const blobUrl = URL.createObjectURL(blob);
+              
+              this.snapshots[camera.id] = {
+                image: blobUrl,
+                timestamp: Date.now(),
+                label: camera.enabled ? 'Online' : 'Offline'
+              };
+            } catch (error) {
+              console.error(`Failed to load snapshot for ${camera.id}:`, error);
+              this.snapshots[camera.id] = {
+                image: `https://picsum.photos/200/150?random=${camera.id}`,
+                timestamp: Date.now(),
+                label: 'Error',
+                error: true
+              };
+            }
+          }
+        });
+        
+        // Wait for all snapshots to load
+        await Promise.all(snapshotPromises);
+        
+        // Track when snapshots were last refreshed
+        this.lastRefreshTime = Date.now();
         
       } catch (error) {
         console.error('Failed to load data:', error);
-        // For now, just log the error. In production, you'd show a user-friendly message
+        // Check if it's an authentication error
+        if (error.message.includes('Authentication required')) {
+          // Force re-authentication
+          localStorage.removeItem('auth_token');
+          this.$router.push('/login');
+          return;
+        }
+        // For other errors, show user-friendly message
+        this.loginError = 'Failed to load camera data. Please refresh the page.';
       } finally {
         this.loading = false;
       }
@@ -219,6 +280,41 @@ export default {
     
     viewMultiview() {
       this.$router.push('/multiview');
+    },
+    
+    startAutoRefresh() {
+      // Stop any existing interval
+      this.stopAutoRefresh();
+      
+      // Auto-refresh snapshots every hour (3600000 ms)
+      this.autoRefreshInterval = setInterval(async () => {
+        console.log('🔄 Auto-refreshing camera snapshots...');
+        try {
+          await this.loadData(true); // Force refresh with timestamp
+        } catch (error) {
+          console.error('Auto-refresh failed:', error);
+        }
+      }, 3600000); // 1 hour = 60 * 60 * 1000 ms
+      
+      console.log('✅ Auto-refresh started: snapshots will update every hour');
+    },
+    
+    stopAutoRefresh() {
+      if (this.autoRefreshInterval) {
+        clearInterval(this.autoRefreshInterval);
+        this.autoRefreshInterval = null;
+        console.log('🛑 Auto-refresh stopped');
+      }
+    },
+    
+    getNextRefreshTime() {
+      if (!this.lastRefreshTime) return '';
+      const nextRefresh = new Date(this.lastRefreshTime + 3600000); // +1 hour
+      return nextRefresh.toLocaleTimeString('en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+        timeZone: 'America/Chicago'
+      });
     }
   }
 };
