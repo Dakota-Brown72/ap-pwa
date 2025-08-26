@@ -47,9 +47,9 @@
       <div 
         v-for="camera in cameras" 
         :key="camera.id" 
-        class="relative group bg-base-100 rounded-xl overflow-hidden shadow-lg hover:shadow-2xl transition-all duration-300"
+        class="relative group bg-base-100 rounded-xl overflow-hidden shadow-lg hover:shadow-2xl transition-all duration-300 camera-container"
       >
-        <div class="aspect-video relative">
+        <div class="aspect-video relative video-wrapper">
           <!-- Adaptive Player (HLS for iOS, MP4 for Desktop) -->
           <AdaptivePlayer
             ref="adaptivePlayers"
@@ -78,7 +78,8 @@
           >
             <span class="loading loading-spinner loading-lg text-primary"></span>
             <div class="ml-2 text-sm">
-              <div>Starting adaptive stream...</div>
+              <div v-if="!autoPlaybackAttempted">Initializing camera stream...</div>
+              <div v-else>Starting adaptive stream...</div>
               <div class="text-xs opacity-70">Optimized for your device</div>
             </div>
           </div>
@@ -186,7 +187,9 @@ export default {
       fullscreenCamera: null,
       // Removed isFullscreen state
       userInteracted: false,
-      keepAliveInterval: null // New property for keep-alive interval
+      keepAliveInterval: null, // New property for keep-alive interval
+      touchStartY: 0, // Track touch position for mobile handling
+      autoPlaybackAttempted: false // Track if we've tried auto-playback
     };
   },
   
@@ -194,8 +197,14 @@ export default {
     await this.loadCameras();
     document.addEventListener('keydown', this.handleKeydown);
     
+    // Add mobile-specific touch event handling
+    this.setupMobileTouchHandling();
+    
     // Start on-demand streaming when multiview loads
     await this.startStreaming();
+    
+    // Auto-start video playback after everything is loaded
+    await this.initializeVideoPlayback();
     
     // Set up keep-alive interval to maintain streams
     this.keepAliveInterval = setInterval(() => {
@@ -205,6 +214,10 @@ export default {
   
   beforeUnmount() {
     document.removeEventListener('keydown', this.handleKeydown);
+    
+    // Clean up mobile touch handlers
+    document.removeEventListener('touchstart', this.handleTouchStart);
+    document.removeEventListener('touchmove', this.handleTouchMove);
     
     // Stop streaming when leaving multiview
     this.stopStreaming();
@@ -263,6 +276,10 @@ export default {
     
     async refreshCameras() {
       await this.loadCameras();
+      
+      // Also restart streaming and auto-playback after refresh
+      await this.startStreaming();
+      await this.initializeVideoPlayback();
     },
     
     async startStreaming() {
@@ -324,19 +341,88 @@ export default {
       
       await Promise.allSettled(keepAlivePromises);
     },
+
+    async initializeVideoPlayback() {
+      try {
+        // Set all cameras to loading state during initialization
+        this.cameras.forEach(camera => {
+          camera.loading = true;
+          camera.error = null;
+        });
+        
+        // Wait for DOM to be fully updated with camera components
+        await this.$nextTick();
+        
+        // Give a small delay to ensure AdaptivePlayer components are fully mounted
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        // Check if we have cameras and AdaptivePlayer components
+        if (this.cameras.length > 0 && this.$refs.adaptivePlayers) {
+          console.log('Auto-starting video playback for all cameras...');
+          
+          // Trigger playback on all cameras
+          await this.playAllVideos();
+          
+          // Mark that we've attempted auto-playback
+          this.autoPlaybackAttempted = true;
+          
+          console.log('Auto-playback initialized successfully');
+        } else {
+          console.log('No cameras or players available for auto-playback');
+          
+          // Clear loading state if no players found
+          this.cameras.forEach(camera => {
+            camera.loading = false;
+          });
+        }
+      } catch (error) {
+        console.error('Error initializing video playback:', error);
+        
+        // Clear loading state on error
+        this.cameras.forEach(camera => {
+          camera.loading = false;
+          camera.error = 'Failed to initialize playback';
+        });
+      }
+    },
     
     async playAllVideos() {
       console.log('Attempting to play all videos');
+      
+      // Ensure we have adaptive players
+      if (!this.$refs.adaptivePlayers || this.$refs.adaptivePlayers.length === 0) {
+        console.log('No AdaptivePlayer components found');
+        return;
+      }
+      
       // Trigger play on all AdaptivePlayer components
-      this.$refs.adaptivePlayers?.forEach(async (player) => {
+      const playPromises = this.$refs.adaptivePlayers.map(async (player, index) => {
         if (player && player.playVideo) {
           try {
+            console.log(`Starting playback for camera ${index + 1}`);
             await player.playVideo();
+            
+            // Update camera state to show it's playing
+            if (this.cameras[index]) {
+              this.cameras[index].loading = false;
+              this.cameras[index].streaming = true;
+              this.cameras[index].showSnapshot = false;
+            }
           } catch (error) {
-            console.log('Failed to play video:', error);
+            console.log(`Failed to play video for camera ${index + 1}:`, error);
+            
+            // Keep snapshot visible if video fails
+            if (this.cameras[index]) {
+              this.cameras[index].loading = false;
+              this.cameras[index].showSnapshot = true;
+            }
           }
         }
       });
+      
+      // Wait for all play attempts to complete
+      await Promise.allSettled(playPromises);
+      console.log('Finished attempting to start all videos');
     },
     
     retryCamera(camera) {
@@ -489,6 +575,33 @@ export default {
         }
       });
     },
+
+    // Setup mobile-specific touch handling
+    setupMobileTouchHandling() {
+      // Prevent iOS momentum scrolling from affecting video containers
+      document.addEventListener('touchstart', this.handleTouchStart, { passive: true });
+      document.addEventListener('touchmove', this.handleTouchMove, { passive: false });
+    },
+
+    handleTouchStart(event) {
+      // Store initial touch position for potential scroll intervention
+      this.touchStartY = event.touches[0].clientY;
+    },
+
+    handleTouchMove(event) {
+      // Prevent rubber band scrolling on video containers
+      const target = event.target.closest('.video-wrapper');
+      if (target) {
+        // Allow normal scrolling but prevent extreme momentum
+        const touchY = event.touches[0].clientY;
+        const deltaY = touchY - this.touchStartY;
+        
+        // If scrolling too fast over video, slightly dampen it
+        if (Math.abs(deltaY) > 50) {
+          event.preventDefault();
+        }
+      }
+    },
   },
 };
 </script>
@@ -510,6 +623,101 @@ video {
 
 :-moz-full-screen {
   background-color: #000;
+}
+
+/* Mobile video containment fixes */
+.camera-container {
+  /* Force hardware acceleration and proper containment */
+  transform: translateZ(0);
+  -webkit-transform: translateZ(0);
+  will-change: auto;
+  contain: layout style paint;
+}
+
+.video-wrapper {
+  /* Ensure videos stay contained during scroll */
+  overflow: hidden;
+  position: relative;
+  /* Force GPU layer for better performance */
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  /* Prevent content from breaking out during scroll */
+  contain: strict;
+}
+
+/* Global video element constraints for mobile */
+:deep(video) {
+  /* Ensure video respects container bounds */
+  max-width: 100% !important;
+  max-height: 100% !important;
+  object-fit: cover;
+  /* Prevent video from being affected by scroll transforms */
+  transform: translate3d(0, 0, 0);
+  -webkit-transform: translate3d(0, 0, 0);
+  /* Lock video position during scroll */
+  position: absolute !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  /* Prevent zoom/scale issues on mobile */
+  -webkit-background-size: cover;
+  background-size: cover;
+}
+
+/* iOS Safari specific fixes */
+@supports (-webkit-touch-callout: none) {
+  .video-wrapper {
+    /* iOS-specific containment */
+    -webkit-overflow-scrolling: auto;
+    isolation: isolate;
+  }
+  
+  :deep(video) {
+    /* Prevent iOS video scaling issues */
+    -webkit-transform: translate3d(0, 0, 0);
+    transform: translate3d(0, 0, 0);
+    -webkit-backface-visibility: hidden;
+    backface-visibility: hidden;
+    /* Force proper video sizing on iOS */
+    object-position: center center;
+  }
+}
+
+/* Mobile-specific adjustments */
+@media (max-width: 768px) {
+  /* Prevent body scroll interference with videos */
+  :deep(body) {
+    -webkit-overflow-scrolling: touch;
+    overflow-scrolling: touch;
+  }
+  
+  .camera-container {
+    /* Enhanced mobile containment */
+    overflow: hidden;
+    isolation: isolate;
+    /* Prevent touch action propagation to videos */
+    touch-action: pan-y;
+  }
+  
+  .video-wrapper {
+    /* Stronger containment for mobile */
+    contain: layout style paint size;
+    /* Prevent momentum scroll interference */
+    -webkit-overflow-scrolling: auto;
+    /* Prevent touch manipulation of videos */
+    touch-action: none;
+  }
+  
+  :deep(video) {
+    /* Mobile video optimization */
+    -webkit-video-autoplay: auto;
+    /* Prevent mobile browser video manipulation */
+    -webkit-transform-style: preserve-3d;
+    transform-style: preserve-3d;
+    /* Prevent video zoom/pan but allow clicks */
+    touch-action: manipulation;
+  }
 }
 
 /* Responsive grid adjustments for 2 cameras */

@@ -8,8 +8,8 @@ services:
     shm_size: "2g"  # Increased for better streaming performance
     # Use host networking for WebRTC connectivity
     network_mode: "host"
-    devices:
-      - /dev/dri:/dev/dri  # Intel QSV hardware acceleration
+    # devices:
+    #   - /dev/dri:/dev/dri  # Intel QSV hardware acceleration (removed; using NVIDIA)
     volumes:
       - ./frigate/config:/config
       - ./frigate/config/go2rtc:/usr/local/go2rtc/bin/go2rtc:ro
@@ -27,13 +27,12 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility,graphics
       - YOLO_MODELS=yolov7-320
-      - USE_FP16=false
+      - USE_FP16=true
       - TRT_MODEL_PREP_DEVICE=0
       - CUDA_VISIBLE_DEVICES=0
-      - CUDA_LAUNCH_BLOCKING=1
-      # Hardware acceleration environment variables
-      - LIBVA_DRIVER_NAME=i965  # Intel QSV driver
-      - VAAPI_DEVICE=/dev/dri/renderD128  # Intel iGPU device
+      # Hardware acceleration environment variables (Intel VAAPI removed)
+      # - LIBVA_DRIVER_NAME=i965
+      # - VAAPI_DEVICE=/dev/dri/renderD128
     # Host networking - no depends_on or networks needed
     logging:
       driver: json-file

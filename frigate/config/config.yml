@@ -9,11 +9,14 @@ mqtt:
 go2rtc:
   ffmpeg:
     # Optimized NVIDIA NVENC preset - reduced memory usage
-    nvenc: -hwaccel cuda -hwaccel_output_format cuda -c:v h264_nvenc -preset p4 -tune ll -rc cbr -b:v 500k -maxrate 800k -bufsize 400k -g 30 -bf 0
+    nvenc: -hwaccel cuda -hwaccel_output_format cuda -c:v h264_nvenc -preset p4 -tune
+      ll -rc cbr -b:v 500k -maxrate 800k -bufsize 400k -g 30 -bf 0
     # Audio transcoding for iOS compatibility  
     audio: -c:a aac -b:a 64k -ar 44100 -ac 2
     # Simplified MP4 streaming - reduced GPU memory usage
-    mp4: -hwaccel cuda -c:v h264_nvenc -preset p4 -profile:v baseline -level 3.1 -pix_fmt yuv420p -vf scale_cuda=960:540 -b:v 400k -maxrate 600k -bufsize 300k -g 30 -c:a aac -b:a 64k -ar 44100 -ac 2
+    mp4: -hwaccel cuda -c:v h264_nvenc -preset p4 -profile:v baseline -level 3.1 -pix_fmt
+      yuv420p -vf scale_cuda=960:540 -b:v 400k -maxrate 600k -bufsize 300k -g 30 -c:a
+      aac -b:a 64k -ar 44100 -ac 2
 
   streams:
     # Source streams (defined first)
@@ -68,12 +71,15 @@ detectors:
   tensorrt:
     type: tensorrt
     device: 0
+  tensorrt_b:
+    type: tensorrt
+    device: 0
 
 # Model configuration - Working YOLOv7-320 with optimizations
 model:
   path: /config/model_cache/tensorrt/yolov7-320.trt
-  input_tensor: nhwc
-  input_pixel_format: rgb
+  input_tensor: nchw
+  input_pixel_format: bgr
   width: 320
   height: 320
 
@@ -105,11 +111,7 @@ ffmpeg:
     - tcp
     - -timeout
     - '5000000'  # Fixed: was -stimeout, now -timeout
-    # Optimized NVIDIA decoding - reduce GPU memory usage
-    - -hwaccel
-    - cuda
-    - -hwaccel_output_format
-    - cuda
+    # Removed duplicate hwaccel options (already included in preset-nvidia-h264)
     - -extra_hw_frames
     - '2'  # Reduced from 8 to save GPU memory
 
@@ -133,8 +135,8 @@ cameras:
       height: 360
       fps: 10
     motion:
-      threshold: 15
-      contour_area: 15
+      threshold: 30
+      contour_area: 10
       delta_alpha: 0.4
       frame_alpha: 0.01
       improve_contrast: true
@@ -156,32 +158,46 @@ cameras:
         - bus
       filters:
         person:
-          min_area: 200  # Increased from 150 to filter out small false positives
+          min_area: 600
           max_area: 100000
-          threshold: 0.5  # Increased from 0.4 to reduce false positives
+          threshold: 0.55
         car:
-          min_area: 2000  # Increased from 1000 for better filtering
-          max_area: 100000
-          threshold: 0.6  # Reduced from 0.7 to catch more cars
+          min_area: 1100
+          max_area: 120000
+          threshold: 0.5
           # mask: 
           #   0.426,0.376,0.485,0.353,0.535,0.309,0.598,0.299,0.649,0.309,0.695,0.327,0.724,0.383,0.735,0.429,0.724,0.509,0.692,0.55,0.669,0.55,0.63,0.524,0.537,0.535,0.521,0.563,0.476,0.572,0.444,0.55,0.402,0.501,0.389,0.451,0.401,0.398
+          mask:
+            - 0.42,0.287,0.756,0.311,0.763,0.575,0.411,0.568
+            - 0.346,0.207,0.351,0.298,0.45,0.284,0.447,0.21
         truck:
-          min_area: 1000
-          max_area: 100000
-          threshold: 0.6
+          min_area: 1200
+          max_area: 150000
+          threshold: 0.5
         motorcycle:
-          min_area: 300
-          max_area: 100000
-          threshold: 0.6
+          min_area: 400
+          max_area: 120000
+          threshold: 0.5
         bicycle:
-          min_area: 300
-          max_area: 100000
-          threshold: 0.6
+          min_area: 400
+          max_area: 120000
+          threshold: 0.5
         bus:
-          min_area: 2000
-          max_area: 100000
-          threshold: 0.6
+          min_area: 2500
+          max_area: 200000
+          threshold: 0.5
 
+    zones:
+      Driveway:
+        coordinates: 0.089,0.406,0.092,0.543,1,0.476,0.939,0.372,0.762,0.366,0.326,0.385
+        loitering_time: 0
+        objects:
+          - car
+          - person
+      Front_Door:
+        coordinates: 0.095,0.555,0.035,0.995,0.722,0.996,0.421,0.527
+        loitering_time: 0
+        objects: person
   Backyard:
     ffmpeg:
       inputs:
@@ -200,8 +216,8 @@ cameras:
       height: 360
       fps: 10
     motion:
-      threshold: 15
-      contour_area: 15
+      threshold: 32
+      contour_area: 23
       delta_alpha: 0.4
       frame_alpha: 0.01
       improve_contrast: true
@@ -223,43 +239,45 @@ cameras:
         - bus
       filters:
         person:
-          min_area: 200  # Increased from 150 to filter out small false positives
+          min_area: 600
           max_area: 100000
-          threshold: 0.5  # Increased from 0.4 to reduce false positives
+          threshold: 0.7
         car:
-          min_area: 2000  # Increased from 1000 for better filtering
-          max_area: 100000
-          threshold: 0.6  # Reduced from 0.7 to catch more cars
+          min_area: 1100
+          max_area: 120000
+          threshold: 0.5
           # mask: 
           #   0.443,0.45,0.463,0.412,0.495,0.403,0.493,0.329,0.557,0.309,0.608,0.302,0.615,0.374,0.599,0.412,0.583,0.461,0.58,0.5,0.542,0.496,0.485,0.503,0.451,0.491
+          mask: 0.426,0.298,0.624,0.285,0.627,0.43,0.429,0.436
         truck:
-          min_area: 1000
-          max_area: 100000
-          threshold: 0.6
+          min_area: 1200
+          max_area: 150000
+          threshold: 0.5
         motorcycle:
-          min_area: 300
-          max_area: 100000
-          threshold: 0.6
+          min_area: 400
+          max_area: 120000
+          threshold: 0.5
         bicycle:
-          min_area: 300
-          max_area: 100000
-          threshold: 0.6
+          min_area: 400
+          max_area: 120000
+          threshold: 0.5
         bus:
-          min_area: 2000
-          max_area: 100000
-          threshold: 0.6
+          min_area: 2500
+          max_area: 200000
+          threshold: 0.5
 
   Living_Room:
     ffmpeg:
       inputs:
         - path: rtsp://localhost:8554/Living_Room  # Indoor camera uses H.264 main stream
-          roles: [detect]  # Add detect role even though detection is disabled
-        - path: rtsp://localhost:8554/Living_Room  # Indoor camera uses H.264 main stream
-          roles: [record]
+          roles: [record]  # Only record role since detection is disabled
+          input_args:
+            - -r
+            - '15'  # Reduced frame rate for stability
     live:
       stream_name: Living_Room_live  # Uses optimized streaming (H.264 direct or transcoded)
     detect:
-      enabled: false  # Detection disabled but stream still processed
+      enabled: false  # Detection completely disabled
     record:
       enabled: true
       retain:
@@ -272,13 +290,14 @@ cameras:
     ffmpeg:
       inputs:
         - path: rtsp://localhost:8554/Nursery  # Indoor camera uses H.264 main stream
-          roles: [detect]  # Add detect role even though detection is disabled
-        - path: rtsp://localhost:8554/Nursery  # Indoor camera uses H.264 main stream
-          roles: [record]
+          roles: [record]  # Only record role since detection is disabled
+          input_args:
+            - -r
+            - '15'  # Reduced frame rate for stability
     live:
       stream_name: Nursery_live  # Uses optimized streaming (H.264 direct or transcoded)
     detect:
-      enabled: false  # Detection disabled but stream still processed
+      enabled: false  # Detection completely disabled
     record:
       enabled: true
       retain:

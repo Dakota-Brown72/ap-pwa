@@ -55,12 +55,19 @@
           <div class="card-body p-4">
             <h2 class="card-title text-base-content mb-2">Recent Camera Events</h2>
             <ul class="divide-y divide-base-200 max-h-56 overflow-y-auto">
-              <li v-for="event in events" :key="event.id" class="py-2 flex items-center gap-2">
-                <span class="badge badge-accent badge-sm">{{ event.type }}</span>
-                <span class="text-sm text-base-content">{{ event.description }}</span>
-                <span class="ml-auto text-xs text-base-content text-opacity-60">{{ event.time }}</span>
+              <li v-for="item in eventSummary" :key="item.id" class="py-2 flex items-center gap-3">
+                <span class="badge badge-accent badge-sm min-w-[64px] justify-center">
+                  {{ prettyText(item.label) || 'Event' }}
+                </span>
+                <span class="text-sm text-base-content flex-1 truncate">
+                  <span class="font-medium">{{ prettyText(item.zone) }}</span><span class="mx-1">:</span>{{ prettyText(item.label) || 'Activity' }}
+                </span>
+                <span class="text-xs text-base-content text-opacity-60 w-24 text-right tabular-nums">{{ formatWhen(item.time) }}</span>
               </li>
             </ul>
+            <div class="mt-3 text-right">
+              <router-link to="/events" class="btn btn-xs btn-outline">View Events</router-link>
+            </div>
           </div>
         </div>
         <!-- System Notifications -->
@@ -144,11 +151,7 @@ export default {
       snapshots: {},
       autoRefreshInterval: null,
       lastRefreshTime: null,
-      events: [
-        { id: 1, type: 'Motion', description: 'Backyard motion detected', time: '10:15 AM' },
-        { id: 2, type: 'Person', description: 'Front door visitor', time: '9:30 AM' },
-        { id: 3, type: 'Motion', description: 'Garage activity', time: '8:45 AM' },
-      ],
+      eventSummary: [],
     };
   },
   
@@ -163,6 +166,11 @@ export default {
   },
   
   methods: {
+    prettyText(value) {
+      if (!value || typeof value !== 'string') return value || '';
+      const spaced = value.replace(/_/g, ' ');
+      return spaced.replace(/\b\w/g, (c) => c.toUpperCase());
+    },
     cleanupBlobUrls() {
       // Clean up blob URLs to prevent memory leaks
       Object.values(this.snapshots).forEach(snapshot => {
@@ -175,67 +183,80 @@ export default {
     async loadData(refresh = false) {
       try {
         this.loading = true;
-        
-        // Clean up old blob URLs
-        this.cleanupBlobUrls();
-        
-        // Load cameras using authenticated endpoint
-        const camerasResponse = await apiService.getCameras();
-        this.cameras = camerasResponse.cameras || [];
-        
-        // Fetch authenticated snapshots and convert to blob URLs
-        this.snapshots = {};
-        const snapshotPromises = this.cameras.map(async (camera) => {
-          if (camera.snapshot_url) {
-            try {
-              // Fetch snapshot with authentication
-              const response = await apiService.request(`${camera.snapshot_url}${refresh ? `?t=${Date.now()}` : ''}`, {
-                headers: {
-                  'Accept': 'image/jpeg,image/png,image/*'
-                }
-              });
-              
-              // Convert response to blob URL
-              const blob = await response.blob();
-              const blobUrl = URL.createObjectURL(blob);
-              
-              this.snapshots[camera.id] = {
-                image: blobUrl,
-                timestamp: Date.now(),
-                label: camera.enabled ? 'Online' : 'Offline'
-              };
-            } catch (error) {
-              console.error(`Failed to load snapshot for ${camera.id}:`, error);
-              this.snapshots[camera.id] = {
-                image: `https://picsum.photos/200/150?random=${camera.id}`,
-                timestamp: Date.now(),
-                label: 'Error',
-                error: true
-              };
-            }
-          }
-        });
-        
-        // Wait for all snapshots to load
-        await Promise.all(snapshotPromises);
-        
-        // Track when snapshots were last refreshed
-        this.lastRefreshTime = Date.now();
-        
-      } catch (error) {
-        console.error('Failed to load data:', error);
-        // Check if it's an authentication error
-        if (error.message.includes('Authentication required')) {
-          // Force re-authentication
-          localStorage.removeItem('auth_token');
-          this.$router.push('/login');
-          return;
+ 
+         // Clean up old blob URLs
+         this.cleanupBlobUrls();
+ 
+         // Load cameras using authenticated endpoint
+         const camerasResponse = await apiService.getCameras();
+         this.cameras = camerasResponse.cameras || [];
+ 
+        // Load event summary for dashboard (Driveway, Front_Door)
+        try {
+          const summary = await apiService.getEventsSummary();
+          this.eventSummary = (summary && summary.items) ? summary.items : [];
+        } catch (e) {
+          this.eventSummary = [];
         }
-        // For other errors, show user-friendly message
-        this.loginError = 'Failed to load camera data. Please refresh the page.';
-      } finally {
-        this.loading = false;
-      }
+
+         // Fetch authenticated snapshots and convert to blob URLs
+         this.snapshots = {};
+         const snapshotPromises = this.cameras.map(async (camera) => {
+           if (camera.snapshot_url) {
+             try {
+               // Fetch snapshot with authentication
+               const response = await apiService.request(`${camera.snapshot_url}${refresh ? `?t=${Date.now()}` : ''}`, {
+                 headers: {
+                   'Accept': 'image/jpeg,image/png,image/*'
+                 }
+               });
+ 
+               // Convert response to blob URL
+               const blob = await response.blob();
+               const blobUrl = URL.createObjectURL(blob);
+ 
+               this.snapshots[camera.id] = {
+                 image: blobUrl,
+                 timestamp: Date.now(),
+                 label: camera.enabled ? 'Online' : 'Offline'
+               };
+             } catch (error) {
+               console.error(`Failed to load snapshot for ${camera.id}:`, error);
+               this.snapshots[camera.id] = {
+                 image: `https://picsum.photos/200/150?random=${camera.id}`,
+                 timestamp: Date.now(),
+                 label: 'Error',
+                 error: true
+               };
+             }
+           }
+         });
+ 
+         // Wait for all snapshots to load
+         await Promise.all(snapshotPromises);
+ 
+         // Track when snapshots were last refreshed
+         this.lastRefreshTime = Date.now();
+ 
+       } catch (error) {
+         console.error('Failed to load data:', error);
+         // Check if it's an authentication error
+         if (error.message.includes('Authentication required')) {
+           // Force re-authentication
+           localStorage.removeItem('auth_token');
+           this.$router.push('/login');
+           return;
+         }
+         // For other errors, show user-friendly message
+         this.loginError = 'Failed to load camera data. Please refresh the page.';
+       } finally {
+         this.loading = false;
+       }
+     },
+     formatWhen(ts) {
+      if (!ts) return '';
+      const d = new Date(ts * 1000);
+      return d.toLocaleTimeString();
     },
     
     async refreshSnapshots() {

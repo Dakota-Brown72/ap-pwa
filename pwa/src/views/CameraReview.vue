@@ -133,9 +133,10 @@
                 {{ formatTimestamp(event.start_time) }} - {{ formatTimestamp(event.end_time) }}
               </div>
             </div>
-            <div class="text-xs text-base-content text-opacity-50">
-              {{ Math.round(event.score * 100) }}%
+            <div class="text-xs text-base-content text-opacity-50 mr-2">
+              {{ Math.round((event.score || 0) * 100) }}%
             </div>
+            <button class="btn btn-xs btn-outline" @click.stop="clearEvent(event)">Clear</button>
           </div>
         </div>
       </div>
@@ -220,31 +221,25 @@ export default {
     
     async loadCameraData() {
       if (!this.selectedCamera) return;
-      
       this.loading = true;
       this.error = null;
-      
       try {
-        // Load events
-        const eventsResponse = await apiService.getFrigateEvents(this.selectedCamera);
+        // Prefer zone-filtered events for Frontyard
+        let zoneFilter = null;
+        if (this.selectedCamera === 'Frontyard') {
+          // show driveway and front door activity
+          zoneFilter = 'Driveway';
+        }
+        const eventsResponse = await apiService.getFrigateEvents(this.selectedCamera, null, null, 100, zoneFilter);
         this.events = eventsResponse || [];
-        
-        // Sort events by start time (newest first)
         this.events.sort((a, b) => b.start_time - a.start_time);
-        
-        // Load recordings
         const recordingsResponse = await apiService.getFrigateRecordings(this.selectedCamera);
         this.recordings = recordingsResponse || [];
-        
-        // Sort recordings by start time (newest first)
         this.recordings.sort((a, b) => b.start_time - a.start_time);
-        
-        // Load the most recent event
         if (this.events.length > 0) {
           this.currentEventIndex = 0;
           await this.loadCurrentEvent();
         }
-        
       } catch (error) {
         console.error('Failed to load camera data:', error);
         this.error = 'Failed to load camera data';
@@ -367,6 +362,19 @@ export default {
       const sizes = ['B', 'KB', 'MB', 'GB'];
       const i = Math.floor(Math.log(bytes) / Math.log(1024));
       return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${sizes[i]}`;
+    },
+
+    async clearEvent(event) {
+      try {
+        await apiService.deleteFrigateEvent(event.id);
+        this.events = this.events.filter(e => e.id !== event.id);
+        if (this.currentEvent && this.currentEvent.id === event.id) {
+          this.currentEventIndex = 0;
+          await this.loadCurrentEvent();
+        }
+      } catch (e) {
+        console.error('Failed to clear event', e);
+      }
     }
   }
 };
