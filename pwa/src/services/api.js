@@ -94,6 +94,52 @@ class ApiService {
     this.clearToken();
   }
 
+  // User
+  async getCurrentUser() {
+    return this.request('/auth/me');
+  }
+
+  async changeUsername(currentUsername, newUsername, confirmUsername) {
+    return this.request('/auth/change-username', {
+      method: 'POST',
+      body: JSON.stringify({
+        current_username: currentUsername,
+        new_username: newUsername,
+        confirm_username: confirmUsername,
+      }),
+    });
+  }
+
+  async changePassword(currentPassword, newPassword, confirmPassword) {
+    return this.request('/auth/change-password', {
+      method: 'POST',
+      body: JSON.stringify({
+        current_password: currentPassword,
+        new_password: newPassword,
+        confirm_password: confirmPassword,
+      }),
+    });
+  }
+
+  // Admin
+  async createUser(username, password, isAdmin = false) {
+    return this.request('/admin/users', {
+      method: 'POST',
+      body: JSON.stringify({ username, password, is_admin: !!isAdmin }),
+    });
+  }
+
+  async listUsers() {
+    return this.request('/admin/users');
+  }
+
+  async toggleUserActive(userId, isActive) {
+    return this.request(`/admin/users/${userId}/active`, {
+      method: 'POST',
+      body: JSON.stringify({ is_active: !!isActive })
+    });
+  }
+
   // Cameras
   async getCameras() {
     return this.request('/cameras');
@@ -176,19 +222,44 @@ class ApiService {
     return await this.request(url);
   }
 
-  async getFrigateEvents(camera = null, before = null, after = null, limit = 100) {
+  // Events (Phase 1 proxies)
+  async getFrigateEvents(camera = null, before = null, after = null, limit = 100, zone = null, label = null) {
     const params = new URLSearchParams();
     if (camera) params.append('camera', camera);
     if (before) params.append('before', before);
     if (after) params.append('after', after);
+    if (label) params.append('label', label);
     params.append('limit', limit.toString());
-    
-    const url = `/frigate/events?${params.toString()}`;
-    return await this.request(url);
+    if (zone) params.append('zone', zone);
+    return await this.request(`/events?${params.toString()}`);
   }
 
-  getFrigateEventClipUrl(eventId) {
-    return `${API_BASE_URL}/frigate/events/${eventId}/clip.mp4`;
+  async getEventsSummary(zones = ['Driveway', 'Front_Door']) {
+    const params = new URLSearchParams();
+    if (zones && zones.length) params.append('zones', zones.join(','));
+    return await this.request(`/events/summary?${params.toString()}`);
+  }
+
+  getEventClipUrl(eventId) {
+    const token = this.token;
+    const qs = token ? `?token=${encodeURIComponent(token)}` : '';
+    return `${API_BASE_URL}/events/${eventId}/clip.mp4${qs}`;
+  }
+
+  getEventClipHlsUrl(eventId) {
+    const token = this.token;
+    const qs = token ? `?token=${encodeURIComponent(token)}` : '';
+    return `${API_BASE_URL}/events/${eventId}/clip.m3u8${qs}`;
+  }
+
+  async deleteEventHls(eventId) {
+    return await this.request(`/events/${eventId}/hls`, { method: 'DELETE' });
+  }
+
+  getEventSnapshotUrl(eventId) {
+    const token = this.token;
+    const qs = token ? `?token=${encodeURIComponent(token)}` : '';
+    return `${API_BASE_URL}/events/${eventId}/snapshot.jpg${qs}`;
   }
 
   // Frigate Recordings API endpoints
