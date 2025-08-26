@@ -132,6 +132,9 @@ export default {
         if (err.status === 429) {
           // Rate limited or IP blocked
           error.value = err.message || 'Too many failed attempts. Please try again later.'
+        } else if (err.status === 403 && err.data?.disabled) {
+          // Account disabled
+          router.push('/quarantine')
         } else if (err.status === 401) {
           // Invalid credentials
           if (err.data?.attempts_remaining !== undefined) {
