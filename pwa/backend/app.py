@@ -4,6 +4,10 @@ import sqlite3
 import requests
 import jwt
 import bcrypt
+import subprocess
+import shutil
+from pathlib import Path
+import ipaddress
 from datetime import datetime, timedelta
 from functools import wraps
 from flask import Flask, request, jsonify, Response, send_from_directory, send_file
@@ -27,6 +31,7 @@ FRIGATE_HOST = os.getenv('FRIGATE_HOST', 'http://frigate:5000')
 GO2RTC_HOST = os.getenv('GO2RTC_HOST', 'http://frigate:1984')
 HLS_SEGMENTS_PATH = os.getenv('HLS_SEGMENTS_PATH', '/segments')
 FFMPEG_SERVICE_HOST = os.getenv('FFMPEG_SERVICE_HOST', 'http://ffmpeg-streamer:8080')  # On-demand FFmpeg service
+GEOIP_PROVIDER = os.getenv('GEOIP_PROVIDER', 'disabled')  # 'disabled' or 'ipapi'
 
 # Database helper functions
 def get_db_connection():
@@ -136,6 +141,20 @@ def init_database():
         conn.execute('CREATE INDEX IF NOT EXISTS idx_login_attempts_time ON login_attempts(attempt_time)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_blocked_ips_address ON blocked_ips(ip_address)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_blocked_ips_until ON blocked_ips(blocked_until)')
+        
+        # IP geolocation cache table
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS ip_geo_cache (
+                ip_address VARCHAR(45) PRIMARY KEY,
+                country TEXT,
+                region TEXT,
+                city TEXT,
+                lat REAL,
+                lon REAL,
+                isp TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
         
         # Check if admin user exists
         admin_username = os.getenv('ADMIN_USERNAME', 'admin')
@@ -289,6 +308,147 @@ def check_rate_limit(ip_address, username):
 # Initialize database on startup
 init_database()
 
+# Safe startup migration: relax unique constraint on users.email if present
+
+def relax_users_email_unique_constraint():
+    """Drop UNIQUE index on users.email if it exists, without rebuilding the table.
+    This avoids UNIQUE constraint failures when inserting placeholder/empty emails
+    until real email collection is implemented.
+    """
+    try:
+        conn = get_db_connection()
+        try:
+            indexes = conn.execute('PRAGMA index_list(users)').fetchall()
+            for idx in indexes or []:
+                try:
+                    idx_name = idx['name'] if isinstance(idx, sqlite3.Row) else idx[1]
+                    is_unique = bool(idx['unique'] if isinstance(idx, sqlite3.Row) else idx[2])
+                except Exception:
+                    continue
+                if not is_unique or not idx_name:
+                    continue
+                # Check which columns are in this index
+                try:
+                    info_rows = conn.execute(f"PRAGMA index_info('{idx_name}')").fetchall()
+                    cols = []
+                    for r in info_rows or []:
+                        try:
+                            cols.append(r['name'] if isinstance(r, sqlite3.Row) else r[2])
+                        except Exception:
+                            pass
+                    # If the index is exactly on email, drop it
+                    if len(cols) == 1 and cols[0] == 'email':
+                        conn.execute(f"DROP INDEX IF EXISTS \"{idx_name}\"")
+                        logger.info(f"Dropped UNIQUE index on users.email: {idx_name}")
+                except Exception as e:
+                    logger.warning(f"Could not inspect index {idx_name}: {e}")
+            conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"Email unique constraint relax migration skipped: {e}")
+
+# Run migration at startup
+relax_users_email_unique_constraint()
+
+def migrate_users_table_if_needed():
+    """Rebuild users table to allow NULL email/full_name and remove UNIQUE(email) if present."""
+    try:
+        conn = get_db_connection()
+        conn.row_factory = sqlite3.Row
+        try:
+            cols = conn.execute("PRAGMA table_info(users)").fetchall() or []
+            email_notnull = False
+            for c in cols:
+                try:
+                    if c['name'] == 'email' and int(c['notnull']) == 1:
+                        email_notnull = True
+                        break
+                except Exception:
+                    pass
+
+            # Detect unique index involving email
+            email_unique = False
+            try:
+                idxs = conn.execute("PRAGMA index_list(users)").fetchall() or []
+                for idx in idxs:
+                    try:
+                        idx_name = idx['name']
+                        is_unique = bool(idx['unique'])
+                    except Exception:
+                        continue
+                    if not is_unique:
+                        continue
+                    info = conn.execute(f"PRAGMA index_info('{idx_name}')").fetchall() or []
+                    cols_in_idx = []
+                    for r in info:
+                        try:
+                            cols_in_idx.append(r['name'])
+                        except Exception:
+                            pass
+                    if 'email' in cols_in_idx:
+                        email_unique = True
+                        break
+            except Exception:
+                pass
+
+            needs = email_notnull or email_unique
+            if not needs:
+                return
+
+            logger.warning("Rebuilding users table to relax constraints on email/full_name")
+            conn.execute("BEGIN IMMEDIATE")
+
+            # Create new table with desired schema
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS users_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    email TEXT,
+                    full_name TEXT,
+                    is_admin BOOLEAN DEFAULT 0,
+                    is_active BOOLEAN DEFAULT 1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_login TIMESTAMP
+                )
+            ''')
+
+            # Copy data, converting empty strings to NULL for email/full_name
+            conn.execute('''
+                INSERT INTO users_new (id, username, password_hash, email, full_name, is_admin, is_active, created_at, last_login)
+                SELECT id, username, password_hash,
+                       NULLIF(email, ''), NULLIF(full_name, ''),
+                       is_admin, is_active, created_at, last_login
+                FROM users
+            ''')
+
+            # Drop old and rename
+            conn.execute('DROP TABLE users')
+            conn.execute('ALTER TABLE users_new RENAME TO users')
+
+            conn.commit()
+            logger.info("Users table rebuilt successfully; email/full_name now nullable and non-unique")
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.error(f"Users table migration failed: {e}")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"Users table migration error: {e}")
+
+# Run guarded table migration
+migrate_users_table_if_needed()
+
 def auth_required(f):
     """Decorator to require authentication"""
     @wraps(f)
@@ -310,7 +470,7 @@ def auth_required(f):
             
             # Fetch user details from the database
             conn = get_db_connection()
-            user = conn.execute('SELECT id, username, is_admin FROM users WHERE id = ?', (current_user_id,)).fetchone()
+            user = conn.execute('SELECT id, username, is_admin, is_active FROM users WHERE id = ?', (current_user_id,)).fetchone()
             conn.close()
 
             if not user:
@@ -321,6 +481,12 @@ def auth_required(f):
             conn.execute('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?', (current_user_id,))
             conn.commit()
             conn.close()
+
+            # If user is disabled and not admin, restrict API access to quarantine-safe endpoints only
+            if not user['is_admin'] and not user['is_active']:
+                allowed = {'/api/auth/me', '/api/auth/logout', '/health'}
+                if request.path not in allowed:
+                    return jsonify({'error': 'Account disabled', 'disabled': True}), 403
 
         except jwt.ExpiredSignatureError:
             return jsonify({'error': 'Token has expired'}), 401
@@ -356,8 +522,8 @@ def login():
         user = conn.execute('SELECT id, username, password_hash, is_admin, is_active FROM users WHERE username = ?', (username,)).fetchone()
         conn.close()
 
-        # Check if user exists and is active
-        if not user or not user['is_active']:
+        # Check if user exists
+        if not user:
             # Record failed attempt
             record_login_attempt(client_ip, username, False, user_agent)
             
@@ -372,6 +538,8 @@ def login():
                 'error': 'Invalid credentials',
                 'attempts_remaining': remaining_attempts
             }), 401
+
+        # Disabled users are permitted to authenticate; access is restricted by auth_required
 
         # Verify password
         if not verify_password(password, user['password_hash']):
@@ -390,25 +558,22 @@ def login():
                 'attempts_remaining': remaining_attempts
             }), 401
 
-        # Successful login
+        # Successful authentication (including disabled accounts)
         record_login_attempt(client_ip, username, True, user_agent)
-        
         token = create_token(user['id'])
-        
         # Update last login
         conn = get_db_connection()
         conn.execute('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?', (user['id'],))
         conn.commit()
         conn.close()
-        
         logger.info(f"Successful login for user {username} from IP {client_ip}")
-        
         return jsonify({
             'token': token,
             'user': {
                 'id': user['id'],
                 'username': user['username'],
-                'is_admin': bool(user['is_admin'])
+                'is_admin': bool(user['is_admin']),
+                'is_active': bool(user['is_active'])
             }
         })
         
@@ -433,7 +598,7 @@ def get_current_user(current_user_id):
     """Get current user information"""
     try:
         conn = get_db_connection()
-        user = conn.execute('SELECT username, email, full_name, is_admin FROM users WHERE id = ?', (current_user_id,)).fetchone()
+        user = conn.execute('SELECT username, email, full_name, is_admin, created_at, last_login FROM users WHERE id = ?', (current_user_id,)).fetchone()
         conn.close()
 
         if not user:
@@ -445,13 +610,112 @@ def get_current_user(current_user_id):
                 'username': user['username'],
                 'email': user['email'],
                 'full_name': user['full_name'],
-                'is_admin': bool(user['is_admin'])
+                'is_admin': bool(user['is_admin']),
+                'created_at': user['created_at'],
+                'last_login': user['last_login']
             }
         })
         
     except Exception as e:
         logger.error(f"Get user error: {e}")
         return jsonify({'error': 'Failed to get user information'}), 500
+
+@app.route('/api/auth/change-username', methods=['POST'])
+@auth_required
+def change_username(current_user_id):
+    """Change the current user's username with validation and uniqueness check."""
+    try:
+        data = request.get_json(silent=True) or {}
+        current_name = (data.get('current_username') or '').strip()
+        new1 = (data.get('new_username') or '').strip()
+        new2 = (data.get('confirm_username') or '').strip()
+
+        if not current_name or not new1 or not new2:
+            return jsonify({'error': 'All fields are required'}), 400
+        if new1 != new2:
+            return jsonify({'error': 'New usernames do not match'}), 400
+        if len(new1) < 3 or len(new1) > 32:
+            return jsonify({'error': 'Username must be 3-32 characters'}), 400
+        if not all(c.isalnum() or c in ('_', '-') for c in new1):
+            return jsonify({'error': 'Username may contain letters, numbers, _ and - only'}), 400
+
+        conn = get_db_connection()
+        user = conn.execute('SELECT username FROM users WHERE id = ?', (current_user_id,)).fetchone()
+        if not user:
+            conn.close()
+            return jsonify({'error': 'User not found'}), 404
+        if user['username'] != current_name:
+            conn.close()
+            return jsonify({'error': 'Current username is incorrect'}), 400
+
+        # Check uniqueness
+        exists = conn.execute('SELECT 1 FROM users WHERE username = ? AND id != ?', (new1, current_user_id)).fetchone()
+        if exists:
+            conn.close()
+            return jsonify({'error': 'Username already taken'}), 409
+
+        # Update
+        conn.execute('UPDATE users SET username = ? WHERE id = ?', (new1, current_user_id))
+        conn.commit()
+        conn.close()
+
+        logger.info(f"User {current_user_id} changed username")
+        return jsonify({'changed': True, 'username': new1})
+    except Exception as e:
+        logger.error(f"Change username error: {e}")
+        return jsonify({'error': 'Failed to change username'}), 500
+
+@app.route('/api/auth/change-password', methods=['POST'])
+@auth_required
+def change_password(current_user_id):
+    """Change the current user's password securely (bcrypt verification + update)."""
+    try:
+        data = request.get_json(silent=True) or {}
+        current_password = data.get('current_password') or ''
+        new_password = data.get('new_password') or ''
+        confirm_password = data.get('confirm_password') or ''
+
+        # Basic validation
+        if not current_password or not new_password or not confirm_password:
+            return jsonify({'error': 'All fields are required'}), 400
+        if new_password != confirm_password:
+            return jsonify({'error': 'New passwords do not match'}), 400
+
+        # Password policy: min 8 chars, must include upper, lower, digit, and symbol
+        if len(new_password) < 8 or \
+           not any(c.islower() for c in new_password) or \
+           not any(c.isupper() for c in new_password) or \
+           not any(c.isdigit() for c in new_password) or \
+           not any(not c.isalnum() for c in new_password):
+            return jsonify({'error': 'Password must be 8+ chars with upper, lower, number, and symbol'}), 400
+
+        conn = get_db_connection()
+        row = conn.execute('SELECT password_hash FROM users WHERE id = ?', (current_user_id,)).fetchone()
+        if not row:
+            conn.close()
+            return jsonify({'error': 'User not found'}), 404
+
+        stored_hash = row['password_hash'] or ''
+        try:
+            ok = bcrypt.checkpw(current_password.encode('utf-8'), stored_hash.encode('utf-8'))
+        except Exception:
+            ok = False
+        if not ok:
+            conn.close()
+            return jsonify({'error': 'Current password is incorrect'}), 400
+
+        # Update with new hash
+        new_hash = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        conn.execute('UPDATE users SET password_hash = ? WHERE id = ?', (new_hash, current_user_id))
+        conn.commit()
+        conn.close()
+
+        # Do not log sensitive data
+        logger.info(f"User {current_user_id} changed password")
+        return jsonify({'changed': True})
+    except Exception as e:
+        logger.error(f"Change password error: {e}")
+        return jsonify({'error': 'Failed to change password'}), 500
 
 @app.route('/api/go2rtc/streams', methods=['GET'])
 @auth_required
@@ -762,6 +1026,269 @@ def get_authenticated_cameras(current_user_id):
     except Exception as e:
         logger.error(f"Error getting cameras: {e}")
         return jsonify({'error': 'Failed to get camera list'}), 500
+
+# ---------- Frigate events proxy (Phase 1) ----------
+@app.route('/api/frigate/events', methods=['GET'])
+@app.route('/api/events', methods=['GET'])
+@auth_required
+def proxy_frigate_events(current_user_id):
+    """Proxy to Frigate /api/events with optional filters: camera, zone, label, before, after, limit."""
+    try:
+        params = {}
+        for key in ['camera', 'label', 'before', 'after', 'limit']:
+            val = request.args.get(key)
+            if val:
+                params[key] = val
+
+        r = requests.get(f"{FRIGATE_HOST}/api/events", params=params, timeout=15)
+        r.raise_for_status()
+        events = r.json() or []
+
+        # Optional zone post-filter
+        zone = request.args.get('zone')
+        if zone:
+            zone_name = zone.strip()
+            events = [e for e in events if isinstance(e, dict) and zone_name in (e.get('zones') or [])]
+
+        return jsonify(events)
+    except Exception as e:
+        logger.error(f"Frigate events proxy error: {e}")
+        return jsonify([]), 200
+
+
+@app.route('/api/frigate/events/<event_id>/clip.mp4', methods=['GET'])
+@app.route('/api/events/<event_id>/clip.mp4', methods=['GET'])
+@auth_required
+def proxy_frigate_event_clip(current_user_id, event_id):
+    """Proxy Frigate event clip for authenticated playback in the PWA (Range-aware)."""
+    try:
+        # Forward Range header for partial content requests
+        forward_headers = {
+            'Accept': 'video/mp4'
+        }
+        incoming_range = request.headers.get('Range')
+        if incoming_range:
+            forward_headers['Range'] = incoming_range
+
+        upstream = requests.get(
+            f"{FRIGATE_HOST}/api/events/{event_id}/clip.mp4",
+            headers=forward_headers,
+            stream=True,
+            timeout=60
+        )
+        upstream.raise_for_status()
+
+        # Build response headers, preserving range-related metadata
+        headers = {
+            'Content-Type': upstream.headers.get('Content-Type', 'video/mp4'),
+            'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+            'Pragma': 'no-cache',
+            'Access-Control-Allow-Origin': '*',
+        }
+        content_length = upstream.headers.get('Content-Length')
+        content_range = upstream.headers.get('Content-Range')
+        accept_ranges = upstream.headers.get('Accept-Ranges', 'bytes')
+        if content_length:
+            headers['Content-Length'] = content_length
+        if content_range:
+            headers['Content-Range'] = content_range
+        if accept_ranges:
+            headers['Accept-Ranges'] = accept_ranges
+
+        status_code = upstream.status_code  # 200 or 206 for partial content
+
+        def generate():
+            try:
+                for chunk in upstream.iter_content(chunk_size=1024 * 256):
+                    if chunk:
+                        yield chunk
+            finally:
+                try:
+                    upstream.close()
+                except:
+                    pass
+
+        return Response(generate(), status=status_code, headers=headers)
+    except Exception as e:
+        logger.error(f"Frigate event clip proxy error for {event_id}: {e}")
+        return jsonify({'error': 'Failed to fetch event clip'}), 500
+
+
+@app.route('/api/events/summary', methods=['GET'])
+@auth_required
+def events_summary(current_user_id):
+    """Return a small summary for dashboard cards: latest per zone of interest."""
+    try:
+        # Zones of interest can be configured later; for now use Driveway and Front_Door
+        zones_of_interest = request.args.get('zones')
+        if zones_of_interest:
+            zones = [z.strip() for z in zones_of_interest.split(',') if z.strip()]
+        else:
+            zones = ['Driveway', 'Front_Door']
+
+        # Pull latest 100 events and pick the most recent per zone
+        r = requests.get(f"{FRIGATE_HOST}/api/events", params={'limit': '100'}, timeout=10)
+        r.raise_for_status()
+        events = r.json() or []
+
+        latest_by_zone = {}
+        for ev in events:
+            ev_zones = ev.get('zones') or []
+            for z in zones:
+                if z in ev_zones:
+                    prev = latest_by_zone.get(z)
+                    if not prev or (ev.get('start_time') or 0) > (prev.get('start_time') or 0):
+                        latest_by_zone[z] = ev
+
+        # Shape a simple payload for UI
+        items = []
+        for z in zones:
+            ev = latest_by_zone.get(z)
+            if ev:
+                items.append({
+                    'zone': z,
+                    'id': ev.get('id'),
+                    'camera': ev.get('camera'),
+                    'label': ev.get('label'),
+                    'time': ev.get('start_time'),
+                })
+
+        return jsonify({'items': items})
+    except Exception as e:
+        logger.error(f"Events summary error: {e}")
+        return jsonify({'items': []}), 200
+
+@app.route('/api/events/<event_id>/snapshot.jpg', methods=['GET'])
+@auth_required
+def proxy_frigate_event_snapshot(current_user_id, event_id):
+    try:
+        upstream = requests.get(f"{FRIGATE_HOST}/api/events/{event_id}/snapshot.jpg", stream=True, timeout=30)
+        upstream.raise_for_status()
+        headers = {
+            'Content-Type': upstream.headers.get('Content-Type', 'image/jpeg'),
+            'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
+            'Pragma': 'no-cache',
+            'Access-Control-Allow-Origin': '*',
+        }
+        def generate():
+            try:
+                for chunk in upstream.iter_content(chunk_size=8192):
+                    if chunk:
+                        yield chunk
+            finally:
+                try:
+                    upstream.close()
+                except:
+                    pass
+        return Response(generate(), status=200, headers=headers)
+    except Exception as e:
+        logger.error(f"Frigate event snapshot proxy error for {event_id}: {e}")
+        return jsonify({'error': 'Failed to fetch event snapshot'}), 500
+
+@app.route('/api/events/<event_id>/clip.m3u8', methods=['GET'])
+@auth_required
+def get_event_clip_hls(current_user_id, event_id):
+    """Generate and serve HLS playlist for a Frigate event clip (on-demand VOD)."""
+    try:
+        base_dir = Path(HLS_SEGMENTS_PATH) / 'events' / event_id
+        playlist_path = base_dir / 'playlist.m3u8'
+
+        # Ensure directory exists
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        # If playlist missing or empty, (re)generate
+        if not playlist_path.exists() or playlist_path.stat().st_size == 0:
+            source_url = f"{FRIGATE_HOST}/api/events/{event_id}/clip.mp4"
+            segment_pattern = str(base_dir / 'segment_%05d.ts')
+            cmd = [
+                'ffmpeg',
+                '-hide_banner', '-loglevel', 'error',
+                '-i', source_url,
+                '-c:v', 'libx264', '-preset', 'veryfast', '-profile:v', 'baseline', '-level', '3.1', '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac', '-b:a', '96k',
+                '-movflags', '+faststart',
+                '-f', 'hls', '-hls_time', '4', '-hls_list_size', '0',
+                '-hls_segment_type', 'mpegts', '-hls_playlist_type', 'vod',
+                '-hls_segment_filename', segment_pattern,
+                str(playlist_path)
+            ]
+            try:
+                logger.info(f"Generating HLS for event {event_id} -> {playlist_path}")
+                subprocess.run(cmd, check=True, timeout=300)
+            except subprocess.TimeoutExpired:
+                logger.error(f"HLS generation timeout for event {event_id}")
+                return jsonify({'error': 'HLS generation timed out'}), 504
+            except subprocess.CalledProcessError as e:
+                logger.error(f"HLS generation failed for event {event_id}: {e}")
+                return jsonify({'error': 'Failed to generate HLS'}), 500
+
+        # Read and rewrite playlist segment URIs to go through our authenticated segment endpoint
+        try:
+            content = playlist_path.read_text()
+            lines = content.split('\n')
+            rewritten = []
+            token = request.headers.get('Authorization')
+            if token and token.startswith('Bearer '):
+                token = token[7:]
+            else:
+                token = request.args.get('token')
+
+            for line in lines:
+                if line.strip().endswith('.ts'):
+                    seg = line.strip()
+                    url = f"/api/events/hls/{event_id}/{seg}"
+                    if token:
+                        url += f"?token={token}"
+                    rewritten.append(url)
+                else:
+                    rewritten.append(line)
+            playlist_mod = '\n'.join(rewritten)
+            headers = {
+                'Content-Type': 'application/vnd.apple.mpegurl',
+                'Cache-Control': 'no-cache, no-store, must-revalidate, max-age=0',
+                'Access-Control-Allow-Origin': '*',
+            }
+            return Response(playlist_mod, status=200, headers=headers)
+        except Exception as e:
+            logger.error(f"Error reading HLS playlist for event {event_id}: {e}")
+            return jsonify({'error': 'Failed to read playlist'}), 500
+
+    except Exception as e:
+        logger.error(f"Event HLS error for {event_id}: {e}")
+        return jsonify({'error': 'HLS failed'}), 500
+
+@app.route('/api/events/hls/<event_id>/<segment>', methods=['GET'])
+@auth_required
+def get_event_hls_segment(current_user_id, event_id, segment):
+    """Serve generated HLS segments for an event clip with auth."""
+    try:
+        if not segment.endswith('.ts') or '/' in segment or '..' in segment:
+            return jsonify({'error': 'Invalid segment'}), 400
+        seg_path = Path(HLS_SEGMENTS_PATH) / 'events' / event_id / segment
+        if not seg_path.exists():
+            return jsonify({'error': 'Segment not found'}), 404
+        return send_file(str(seg_path), mimetype='video/mp2t', as_attachment=False, conditional=True)
+    except Exception as e:
+        logger.error(f"Event HLS segment error for {event_id}/{segment}: {e}")
+        return jsonify({'error': 'Failed to serve segment'}), 500
+
+@app.route('/api/events/<event_id>/hls', methods=['DELETE'])
+@auth_required
+def delete_event_hls(current_user_id, event_id):
+    """Delete generated HLS assets for an event (cleanup on UI close)."""
+    try:
+        event_dir = Path(HLS_SEGMENTS_PATH) / 'events' / event_id
+        if event_dir.exists() and event_dir.is_dir():
+            try:
+                shutil.rmtree(event_dir)
+                logger.info(f"Deleted HLS directory for event {event_id}: {event_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to delete HLS directory for event {event_id}: {e}")
+                return jsonify({'deleted': False, 'error': 'Delete failed'}), 500
+        return jsonify({'deleted': True})
+    except Exception as e:
+        logger.error(f"Event HLS delete error for {event_id}: {e}")
+        return jsonify({'deleted': False, 'error': 'Unexpected error'}), 500
 
 @app.route('/api/camera/<camera_id>/stream.mp4', methods=['GET'])
 def get_camera_mp4_stream(camera_id):
@@ -1134,17 +1661,93 @@ def get_login_attempts(current_user_id):
             ORDER BY attempt_time DESC
             LIMIT 100
         ''').fetchall()
-        
         conn.close()
-        
+
+        # Helper: determine if IP was blocked at attempt time
+        def was_ip_blocked_at(ip_addr, when_ts):
+            try:
+                c = get_db_connection()
+                row = c.execute('''
+                    SELECT 1 FROM blocked_ips
+                    WHERE ip_address = ?
+                    AND blocked_at <= ?
+                    AND blocked_until >= ?
+                    LIMIT 1
+                ''', (ip_addr, when_ts, when_ts)).fetchone()
+                c.close()
+                return row is not None
+            except Exception:
+                return False
+
+        # Helper: best-effort IP location (cached)
+        def get_ip_location(ip_addr):
+            # Private/reserved networks
+            try:
+                ip_obj = ipaddress.ip_address(ip_addr)
+                if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_reserved:
+                    return 'Private Network'
+            except Exception:
+                return 'Unknown'
+
+            if GEOIP_PROVIDER.lower() != 'ipapi':
+                return 'Unknown'
+
+            # Check cache (valid for 7 days)
+            try:
+                c = get_db_connection()
+                cached = c.execute('''
+                    SELECT country, region, city, updated_at FROM ip_geo_cache WHERE ip_address = ?
+                ''', (ip_addr,)).fetchone()
+                if cached:
+                    # Assume cache fresh enough
+                    country = cached['country'] or ''
+                    region = cached['region'] or ''
+                    city = cached['city'] or ''
+                    c.close()
+                    loc = ', '.join([p for p in [city, region, country] if p])
+                    return loc if loc else 'Unknown'
+                c.close()
+            except Exception:
+                pass
+
+            # Lookup via ip-api.com (no key, best-effort)
+            try:
+                r = requests.get(f"http://ip-api.com/json/{ip_addr}?fields=status,country,regionName,city,query&lang=en", timeout=4)
+                data = r.json() if r and r.headers.get('Content-Type','').startswith('application/json') else {}
+                if data.get('status') == 'success':
+                    country = data.get('country')
+                    region = data.get('regionName')
+                    city = data.get('city')
+                    # Save to cache
+                    try:
+                        c = get_db_connection()
+                        c.execute('''
+                            INSERT OR REPLACE INTO ip_geo_cache (ip_address, country, region, city, updated_at)
+                            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ''', (ip_addr, country, region, city))
+                        c.commit()
+                        c.close()
+                    except Exception:
+                        pass
+                    loc = ', '.join([p for p in [city, region, country] if p])
+                    return loc if loc else 'Unknown'
+            except Exception:
+                pass
+
+            return 'Unknown'
+
         attempts_list = []
         for attempt in attempts:
+            ip_addr = attempt['ip_address']
+            when_ts = attempt['attempt_time']
             attempts_list.append({
-                'ip_address': attempt['ip_address'],
+                'ip_address': ip_addr,
                 'username': attempt['username'],
                 'success': bool(attempt['success']),
-                'attempt_time': attempt['attempt_time'],
-                'user_agent': attempt['user_agent']
+                'attempt_time': when_ts,
+                'user_agent': attempt['user_agent'],
+                'blocked': was_ip_blocked_at(ip_addr, when_ts),
+                'location': get_ip_location(ip_addr)
             })
         
         return jsonify({'login_attempts': attempts_list})
@@ -1153,9 +1756,133 @@ def get_login_attempts(current_user_id):
         logger.error(f"Error getting login attempts: {e}")
         return jsonify({'error': 'Failed to get login attempts'}), 500
 
+@app.route('/api/admin/users', methods=['POST'])
+@auth_required
+def admin_create_user(current_user_id):
+    """Admin-only: create a new user with username, password (hashed), and role."""
+    try:
+        # Verify admin
+        conn = get_db_connection()
+        me = conn.execute('SELECT is_admin FROM users WHERE id = ?', (current_user_id,)).fetchone()
+        if not me or not me['is_admin']:
+            conn.close()
+            return jsonify({'error': 'Admin access required'}), 403
 
+        data = request.get_json(silent=True) or {}
+        username = (data.get('username') or '').strip()
+        password = data.get('password') or ''
+        is_admin = bool(data.get('is_admin') or False)
 
+        # Validate username
+        if not username or len(username) < 3 or len(username) > 32:
+            conn.close()
+            return jsonify({'error': 'Username must be 3-32 characters'}), 400
+        if not all(c.isalnum() or c in ('_', '-') for c in username):
+            conn.close()
+            return jsonify({'error': 'Username may contain letters, numbers, _ and - only'}), 400
 
+        # Validate password (reuse same policy)
+        if len(password) < 8 or \
+           not any(c.islower() for c in password) or \
+           not any(c.isupper() for c in password) or \
+           not any(c.isdigit() for c in password) or \
+           not any(not c.isalnum() for c in password):
+            conn.close()
+            return jsonify({'error': 'Password must be 8+ chars with upper, lower, number, and symbol'}), 400
+
+        # Uniqueness
+        exists = conn.execute('SELECT 1 FROM users WHERE username = ?', (username,)).fetchone()
+        if exists:
+            conn.close()
+            return jsonify({'error': 'Username already taken'}), 409
+
+        # Create user
+        password_hash = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        cur = conn.execute('''
+            INSERT INTO users (username, password_hash, email, full_name, is_admin, is_active)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (username, password_hash, None, None, 1 if is_admin else 0, 1))
+        user_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+
+        logger.info(f"Admin {current_user_id} created user {username} (admin={is_admin})")
+        return jsonify({'created': True, 'user': {'id': user_id, 'username': username, 'is_admin': is_admin}}), 201
+    except Exception as e:
+        logger.error(f"Admin create user error: {e}")
+        return jsonify({'error': 'Failed to create user'}), 500
+
+@app.route('/api/admin/users', methods=['GET'])
+@auth_required
+def admin_list_users(current_user_id):
+    """Admin-only: list users with id, username, role, status, and timestamps."""
+    try:
+        conn = get_db_connection()
+        me = conn.execute('SELECT is_admin FROM users WHERE id = ?', (current_user_id,)).fetchone()
+        if not me or not me['is_admin']:
+            conn.close()
+            return jsonify({'error': 'Admin access required'}), 403
+
+        rows = conn.execute('''
+            SELECT id, username, is_admin, is_active, created_at, last_login
+            FROM users
+            ORDER BY username COLLATE NOCASE ASC
+        ''').fetchall()
+        conn.close()
+
+        users = []
+        for r in rows:
+            users.append({
+                'id': r['id'],
+                'username': r['username'],
+                'is_admin': bool(r['is_admin']),
+                'is_active': bool(r['is_active']),
+                'created_at': r['created_at'],
+                'last_login': r['last_login']
+            })
+        return jsonify({'users': users})
+    except Exception as e:
+        logger.error(f"Admin list users error: {e}")
+        return jsonify({'error': 'Failed to list users'}), 500
+
+@app.route('/api/admin/users/<int:user_id>/active', methods=['POST'])
+@auth_required
+def admin_toggle_user_active(current_user_id, user_id):
+    """Admin-only: enable/disable a user account by toggling is_active."""
+    try:
+        data = request.get_json(silent=True) or {}
+        is_active = bool(data.get('is_active'))
+
+        conn = get_db_connection()
+        me = conn.execute('SELECT is_admin FROM users WHERE id = ?', (current_user_id,)).fetchone()
+        if not me or not me['is_admin']:
+            conn.close()
+            return jsonify({'error': 'Admin access required'}), 403
+
+        # Prevent self-disabling via API
+        if user_id == current_user_id:
+            conn.close()
+            return jsonify({'error': 'Cannot modify your own active status'}), 400
+
+        # Fetch target user
+        target = conn.execute('SELECT id, is_admin FROM users WHERE id = ?', (user_id,)).fetchone()
+        if not target:
+            conn.close()
+            return jsonify({'error': 'User not found'}), 404
+
+        # Optional: prevent disabling admins (leave enabled) unless future policy says otherwise
+        if target['is_admin'] and not is_active:
+            conn.close()
+            return jsonify({'error': 'Cannot disable an admin account'}), 400
+
+        conn.execute('UPDATE users SET is_active = ? WHERE id = ?', (1 if is_active else 0, user_id))
+        conn.commit()
+        conn.close()
+        logger.info(f"Admin {current_user_id} set user {user_id} active={is_active}")
+        return jsonify({'updated': True, 'is_active': is_active})
+    except Exception as e:
+        logger.error(f"Admin toggle user error: {e}")
+        return jsonify({'error': 'Failed to update user status'}), 500
 
 @app.route('/api/go2rtc/mse/<stream_name>', methods=['OPTIONS'])
 def cors_preflight_mse(stream_name):
@@ -1180,16 +1907,248 @@ def cleanup():
 import atexit
 import threading
 import time
+import gc
+import os
+
+# Memory management configuration
+MEMORY_CHECK_INTERVAL = 300  # Check memory every 5 minutes
+MAX_UPTIME_HOURS = 72       # Trigger more aggressive cleanup after 3 days
+
+def get_process_memory_info():
+    """Get basic memory information without external dependencies"""
+    try:
+        pid = os.getpid()
+        
+        # Read basic memory info from /proc/self/status
+        memory_info = {}
+        with open('/proc/self/status', 'r') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    memory_info['rss_kb'] = int(line.split()[1])
+                elif line.startswith('VmSize:'):
+                    memory_info['vms_kb'] = int(line.split()[1])
+                elif line.startswith('VmSwap:'):
+                    memory_info['swap_kb'] = int(line.split()[1])
+        
+        # Calculate uptime using process start time
+        try:
+            with open('/proc/self/stat', 'r') as f:
+                stat_data = f.read().split()
+                # starttime is the 22nd field (index 21) in clock ticks
+                starttime_ticks = int(stat_data[21])
+                # Get system boot time and convert to uptime
+                with open('/proc/uptime', 'r') as uptime_file:
+                    system_uptime = float(uptime_file.read().split()[0])
+                # Clock ticks per second (usually 100)
+                ticks_per_sec = os.sysconf(os.sysconf_names['SC_CLK_TCK'])
+                process_uptime = system_uptime - (starttime_ticks / ticks_per_sec)
+                memory_info['uptime_hours'] = process_uptime / 3600
+        except Exception:
+            memory_info['uptime_hours'] = 0
+        
+        return memory_info
+        
+    except Exception as e:
+        logger.error(f"Error getting memory info: {e}")
+        return None
+
+def force_garbage_collection():
+    """Force Python garbage collection and return collected object count"""
+    try:
+        # Get initial object count
+        before_gc = len(gc.get_objects())
+        
+        # Run all generations of garbage collection
+        collected_counts = []
+        for generation in range(3):
+            collected = gc.collect(generation)
+            collected_counts.append(collected)
+        
+        after_gc = len(gc.get_objects())
+        total_collected = sum(collected_counts)
+        
+        logger.info(f"Garbage collection: freed {before_gc - after_gc} objects ({total_collected} collected)")
+        return total_collected
+        
+    except Exception as e:
+        logger.error(f"Error in garbage collection: {e}")
+        return 0
+
+def cleanup_application_resources():
+    """Clean up application-specific resources that might be leaking"""
+    cleaned_count = 0
+    
+    try:
+        # Force garbage collection
+        gc_count = force_garbage_collection()
+        cleaned_count += gc_count
+        
+        # Clear any module-level caches
+        if hasattr(gc, 'garbage'):
+            gc.garbage.clear()
+        
+        logger.info(f"Application resource cleanup completed: {cleaned_count} objects cleaned")
+        return cleaned_count
+        
+    except Exception as e:
+        logger.error(f"Error in application resource cleanup: {e}")
+        return cleaned_count
+
+def check_and_cleanup_memory():
+    """Check memory usage and trigger cleanup if needed"""
+    try:
+        memory_info = get_process_memory_info()
+        if not memory_info:
+            return False
+            
+        rss_mb = memory_info.get('rss_kb', 0) / 1024
+        swap_mb = memory_info.get('swap_kb', 0) / 1024
+        uptime_hours = memory_info.get('uptime_hours', 0)
+        
+        # Log current memory status every 5th check (every 25 minutes)
+        if hasattr(check_and_cleanup_memory, 'check_count'):
+            check_and_cleanup_memory.check_count += 1
+        else:
+            check_and_cleanup_memory.check_count = 1
+            
+        if check_and_cleanup_memory.check_count % 5 == 0:
+            logger.info(f"Memory status: RSS={rss_mb:.1f}MB, Swap={swap_mb:.1f}MB, Uptime={uptime_hours:.1f}h")
+        
+        # Determine if cleanup is needed
+        cleanup_needed = False
+        reasons = []
+        
+        # Cleanup triggers
+        if swap_mb > 30:  # More than 30MB swap
+            cleanup_needed = True
+            reasons.append(f"swap({swap_mb:.1f}MB > 30MB)")
+            
+        if rss_mb > 50:  # More than 50MB resident
+            cleanup_needed = True
+            reasons.append(f"rss({rss_mb:.1f}MB > 50MB)")
+            
+        if uptime_hours > MAX_UPTIME_HOURS:  # Running for more than 3 days
+            cleanup_needed = True
+            reasons.append(f"uptime({uptime_hours:.1f}h > {MAX_UPTIME_HOURS}h)")
+        
+        if cleanup_needed:
+            logger.warning(f"Memory cleanup triggered: {', '.join(reasons)}")
+            cleaned = cleanup_application_resources()
+            
+            # Check memory after cleanup
+            new_memory_info = get_process_memory_info()
+            if new_memory_info:
+                new_swap = new_memory_info.get('swap_kb', 0) / 1024
+                new_rss = new_memory_info.get('rss_kb', 0) / 1024
+                swap_saved = swap_mb - new_swap
+                rss_saved = rss_mb - new_rss
+                
+                logger.info(f"Cleanup results: Swap saved {swap_saved:.1f}MB, RSS saved {rss_saved:.1f}MB")
+            
+            return True
+        
+        return False
+        
+    except Exception as e:
+        logger.error(f"Error in memory check and cleanup: {e}")
+        return False
 
 def periodic_cleanup():
-    """Periodically clean up expired blocks and old login attempts"""
+    """Enhanced periodic cleanup including memory management and expired blocks"""
+    logger.info("Starting enhanced periodic cleanup thread")
+    
     while True:
         try:
+            # Database cleanup (existing)
             cleanup_expired_blocks()
-            time.sleep(3600)  # Run every hour
+            
+            # Memory management (new)
+            check_and_cleanup_memory()
+            
+            # Sleep for memory check interval (5 minutes)
+            time.sleep(MEMORY_CHECK_INTERVAL)
+            
         except Exception as e:
             logger.error(f"Error in periodic cleanup: {e}")
             time.sleep(60)  # Wait 1 minute before retrying
+
+# Memory monitoring API endpoints (lightweight versions)
+
+@app.route('/api/debug/memory', methods=['GET'])
+@auth_required
+def get_memory_status(current_user_id):
+    """Get current memory usage information - requires authentication"""
+    try:
+        memory_info = get_process_memory_info()
+        if not memory_info:
+            return jsonify({'error': 'Could not get memory information'}), 500
+            
+        # Convert to MB for readability
+        memory_mb = {
+            'rss_mb': memory_info.get('rss_kb', 0) / 1024,
+            'vms_mb': memory_info.get('vms_kb', 0) / 1024,
+            'swap_mb': memory_info.get('swap_kb', 0) / 1024,
+            'uptime_hours': memory_info.get('uptime_hours', 0)
+        }
+        
+        return jsonify({
+            'memory': memory_mb,
+            'thresholds': {
+                'swap_mb': 30,
+                'rss_mb': 50,
+                'max_uptime_hours': MAX_UPTIME_HOURS
+            },
+            'gc_stats': {
+                'counts': gc.get_count(),
+                'threshold': gc.get_threshold()
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting memory status: {e}")
+        return jsonify({'error': 'Failed to get memory status'}), 500
+
+@app.route('/api/debug/memory/cleanup', methods=['POST'])
+@auth_required  
+def trigger_memory_cleanup(current_user_id):
+    """Manually trigger memory cleanup - requires authentication"""
+    try:
+        # Check if user is admin
+        conn = get_db_connection()
+        user = conn.execute('SELECT is_admin FROM users WHERE id = ?', (current_user_id,)).fetchone()
+        conn.close()
+        
+        if not user or not user['is_admin']:
+            return jsonify({'error': 'Admin access required'}), 403
+            
+        # Get memory before cleanup
+        before_memory = get_process_memory_info()
+        
+        # Run cleanup
+        cleaned = cleanup_application_resources()
+        
+        # Get memory after cleanup  
+        after_memory = get_process_memory_info()
+        
+        result = {
+            'cleanup_triggered': True,
+            'objects_cleaned': cleaned,
+            'memory_before': before_memory,
+            'memory_after': after_memory
+        }
+        
+        if before_memory and after_memory:
+            result['memory_saved'] = {
+                'rss_mb': (before_memory.get('rss_kb', 0) - after_memory.get('rss_kb', 0)) / 1024,
+                'swap_mb': (before_memory.get('swap_kb', 0) - after_memory.get('swap_kb', 0)) / 1024
+            }
+        
+        logger.info(f"Manual memory cleanup triggered by admin user {current_user_id}")
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"Error in manual memory cleanup: {e}")
+        return jsonify({'error': 'Memory cleanup failed'}), 500
 
 # Start background cleanup thread
 cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
@@ -1198,6 +2157,11 @@ cleanup_thread.start()
 atexit.register(cleanup)
 
 if __name__ == '__main__':
+    # Log startup memory info
+    startup_memory = get_process_memory_info()
+    if startup_memory:
+        logger.info(f"Backend starting - Initial memory: RSS={startup_memory.get('rss_kb', 0)/1024:.1f}MB, Swap={startup_memory.get('swap_kb', 0)/1024:.1f}MB")
+    
     # Disable debug mode in production
     debug_mode = os.getenv('FLASK_DEBUG', 'false').lower() == 'true'
     app.run(host='0.0.0.0', port=5003, debug=debug_mode)
